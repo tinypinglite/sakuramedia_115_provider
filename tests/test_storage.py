@@ -265,10 +265,12 @@ class VirtualRangeReader:
         file_size_bytes: int,
         chunk_size: int,
         max_fetched_bytes: int,
+        request_delay_range: tuple[float, float] | None = None,
     ) -> None:
         assert user_agent == storage.THUMBNAIL_USER_AGENT
         assert chunk_size == 1024 * 1024
         assert max_fetched_bytes == 8 * 1024 * 1024
+        assert request_delay_range == storage._HASH_REQUEST_DELAY_RANGE
         self._position = 0
         self._size = file_size_bytes
 
@@ -316,9 +318,13 @@ def _hash_media(size_bytes: int) -> MediaHandle:
 
 
 def test_compute_file_hash_matches_shared_protocol_vectors(monkeypatch, tmp_path) -> None:
+    async def no_sleep(_delay: float) -> None:
+        return None
+
     HashClient.file_size_bytes = 8 * 1024 * 1024
     monkeypatch.setattr(storage, "Cloud115Client", HashClient)
     monkeypatch.setattr(storage, "Cloud115RangeReader", VirtualRangeReader)
+    monkeypatch.setattr(storage.asyncio, "sleep", no_sleep)
     provider = storage.Cloud115StorageProvider(
         library=_hash_media(HashClient.file_size_bytes).library,
         data_dir=tmp_path,
@@ -334,9 +340,33 @@ def test_compute_file_hash_matches_shared_protocol_vectors(monkeypatch, tmp_path
     )
 
 
+def test_compute_file_hash_delays_download_url(monkeypatch, tmp_path) -> None:
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(storage, "Cloud115Client", HashClient)
+    monkeypatch.setattr(storage.asyncio, "sleep", sleep)
+    monkeypatch.setattr(storage.random, "uniform", lambda low, high: 3.0)
+    HashClient.file_size_bytes = 0
+    provider = storage.Cloud115StorageProvider(
+        library=_hash_media(0).library,
+        data_dir=tmp_path,
+    )
+
+    provider.compute_file_hash(media=_hash_media(0))
+
+    assert delays == [3.0]
+
+
 def test_compute_file_hash_rejects_a_changed_remote_size(monkeypatch, tmp_path) -> None:
+    async def no_sleep(_delay: float) -> None:
+        return None
+
     HashClient.file_size_bytes = 101
     monkeypatch.setattr(storage, "Cloud115Client", HashClient)
+    monkeypatch.setattr(storage.asyncio, "sleep", no_sleep)
     provider = storage.Cloud115StorageProvider(
         library=_hash_media(100).library,
         data_dir=tmp_path,

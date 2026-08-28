@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import random
 import re
+import time
 
 import httpx
 from typing_extensions import Self
@@ -23,6 +25,7 @@ class Cloud115RangeReader:
         file_size_bytes: int,
         chunk_size: int = 4 * 1024 * 1024,
         max_fetched_bytes: int | None = None,
+        request_delay_range: tuple[float, float] | None = None,
     ) -> None:
         if not url or not user_agent or file_size_bytes <= 0 or chunk_size <= 0:
             raise ValueError("invalid 115 range reader arguments")
@@ -31,6 +34,7 @@ class Cloud115RangeReader:
         self._file_size = file_size_bytes
         self._chunk_size = chunk_size
         self._max_fetched_bytes = max_fetched_bytes
+        self._request_delay_range = request_delay_range
         self._client = httpx.Client(timeout=30.0, trust_env=False, follow_redirects=True)
         self._position = 0
         self._buffer = b""
@@ -99,6 +103,8 @@ class Cloud115RangeReader:
             count = min(count, remaining)
         end = min(start + count, self._file_size) - 1
         try:
+            if self._request_delay_range is not None:
+                time.sleep(random.uniform(*self._request_delay_range))
             with self._client.stream(
                 "GET",
                 self._url,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import random
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -66,6 +68,7 @@ _HASH_DOMAIN = b"media-file-hash-v1"
 _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
 _HASH_MIDDLE_BYTES = 1024 * 1024
 _HASH_FULL_THRESHOLD = 8 * 1024 * 1024
+_HASH_REQUEST_DELAY_RANGE = (2.0, 4.0)
 _VIDEO_SUFFIXES = frozenset(
     {
         ".3gp",
@@ -376,6 +379,7 @@ class Cloud115StorageProvider:
 
         async def resolve():
             async with Cloud115Client(self._device_cookie) as client:
+                await asyncio.sleep(random.uniform(*_HASH_REQUEST_DELAY_RANGE))
                 return await client.get_download_url(
                     entry.pickcode, user_agent=THUMBNAIL_USER_AGENT
                 )
@@ -402,6 +406,7 @@ class Cloud115StorageProvider:
             file_size_bytes=size,
             chunk_size=_HASH_MIDDLE_BYTES,
             max_fetched_bytes=_HASH_FULL_THRESHOLD,
+            request_delay_range=_HASH_REQUEST_DELAY_RANGE,
         )
         try:
             def read_at(offset: int, length: int) -> bytes:
