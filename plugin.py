@@ -54,7 +54,7 @@ LIBRARY_CONFIG_FIELDS = (
         input="path",
         required=True,
         description="115 离线任务的保存目录，填 115 绝对路径。",
-        hint="例如 /下载/SakuraMedia",
+        hint="例如 /下载/视频",
     ),
     ConfigField(
         key="device_cookie",

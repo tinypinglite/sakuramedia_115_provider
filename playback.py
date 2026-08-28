@@ -38,7 +38,7 @@ from .exceptions import (
     Cloud115RequestError,
 )
 
-PROXY_USER_AGENT = "Mozilla/5.0 SakuraMedia-115-Proxy/1.0"
+_BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
 _DIRECT_URL_CACHE_TTL_SECONDS = 6 * 60 * 60
 _HLS_PATH = re.compile(r"^hls/([A-Za-z0-9_-]{16,})/segment/(\d+)\.ts$")
 _ONE_RANGE = re.compile(r"^bytes=(?:\d+-\d*|\d*-\d+)$")
@@ -231,7 +231,7 @@ class Cloud115Playback:
         )
 
     async def _resolve_hls(self, *, media: MediaHandle, pickcode: str) -> _HlsEntry:
-        async with Cloud115Client(self._device_cookie, user_agent=PROXY_USER_AGENT) as client:
+        async with Cloud115Client(self._device_cookie) as client:
             info = await client.get_video_info(pickcode)
             segments = await client.get_video_segments(choose_hls_definition(info.definitions))
         return _CACHE.put_hls(
@@ -262,7 +262,7 @@ class Cloud115Playback:
         try:
             return await self._external_relay(
                 url=entry.segments[index].url,
-                user_agent=PROXY_USER_AGENT,
+                user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
             )
@@ -275,7 +275,7 @@ class Cloud115Playback:
         # same segment index; retrying repeatedly would turn a player loop into
         # uncontrolled traffic.
         try:
-            async with Cloud115Client(self._device_cookie, user_agent=PROXY_USER_AGENT) as client:
+            async with Cloud115Client(self._device_cookie) as client:
                 info = await client.get_video_info(pickcode)
                 segments = await client.get_video_segments(choose_hls_definition(info.definitions))
             _CACHE.refresh_hls(entry, segments)
@@ -283,7 +283,7 @@ class Cloud115Playback:
                 raise Cloud115NotFoundError("115 HLS 分片不存在")
             return await self._external_relay(
                 url=segments[index].url,
-                user_agent=PROXY_USER_AGENT,
+                user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
             )
@@ -301,7 +301,7 @@ class Cloud115Playback:
         key, entry = await self._direct_entry(
             media=media,
             pickcode=pickcode,
-            user_agent=PROXY_USER_AGENT,
+            user_agent=_BROWSER_USER_AGENT,
         )
         for attempt in range(2):
             try:
@@ -318,7 +318,7 @@ class Cloud115Playback:
                 _, entry = await self._direct_entry(
                     media=media,
                     pickcode=pickcode,
-                    user_agent=PROXY_USER_AGENT,
+                    user_agent=_BROWSER_USER_AGENT,
                 )
             except Cloud115RequestError as exc:
                 raise _provider_error("playback", "unavailable", "115 直链读取失败", retryable=True) from exc

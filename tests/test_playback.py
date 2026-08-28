@@ -4,6 +4,7 @@ import asyncio
 
 from sakuramedia_115_provider import playback
 from sakuramedia_115_provider.cloud115 import (
+    Cloud115Client,
     Cloud115DirectUrl,
     Cloud115VideoDefinition,
     Cloud115VideoInfo,
@@ -115,9 +116,9 @@ def test_proxy_falls_back_to_fixed_ua_range_relay(monkeypatch) -> None:
 
     assert response.status_code == 206
     assert seen["url"] == "https://direct/file"
-    assert seen["user_agent"] == playback.PROXY_USER_AGENT
+    assert seen["user_agent"] == Cloud115Client.DEFAULT_USER_AGENT
     assert seen["range"] == "bytes=0-9"
-    assert FakeClient.download_user_agents == [playback.PROXY_USER_AGENT]
+    assert FakeClient.download_user_agents == [Cloud115Client.DEFAULT_USER_AGENT]
 
 
 def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:

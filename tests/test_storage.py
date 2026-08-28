@@ -5,6 +5,7 @@ from typing import ClassVar
 import pytest
 from sakuramedia_115_provider import storage
 from sakuramedia_115_provider.cloud115 import (
+    Cloud115Client,
     Cloud115DirectoryInfo,
     Cloud115DirectUrl,
     Cloud115Entry,
@@ -267,7 +268,7 @@ class VirtualRangeReader:
         max_fetched_bytes: int,
         request_delay_range: tuple[float, float] | None = None,
     ) -> None:
-        assert user_agent == storage.THUMBNAIL_USER_AGENT
+        assert user_agent == Cloud115Client.DEFAULT_USER_AGENT
         assert chunk_size == 1024 * 1024
         assert max_fetched_bytes == 8 * 1024 * 1024
         assert request_delay_range == storage._HASH_REQUEST_DELAY_RANGE
@@ -376,6 +377,30 @@ def test_compute_file_hash_rejects_a_changed_remote_size(monkeypatch, tmp_path) 
         provider.compute_file_hash(media=_hash_media(100))
 
     assert exc_info.value.code == "unavailable"
+
+
+def test_open_cover_source_uses_a_bounded_range_reader(monkeypatch, tmp_path) -> None:
+    provider = storage.Cloud115StorageProvider(
+        library=_hash_media(100).library,
+        data_dir=tmp_path,
+    )
+    reader = object()
+    calls = []
+
+    def range_reader(media, *, operation, max_fetched_bytes):
+        calls.append((media, operation, max_fetched_bytes))
+        return reader
+
+    monkeypatch.setattr(provider, "_range_reader", range_reader)
+
+    assert provider.open_cover_source(media=_hash_media(100)) is reader
+    assert calls == [
+        (
+            _hash_media(100),
+            "open_cover_source",
+            storage.COVER_MAX_FETCHED_BYTES,
+        )
+    ]
 
 
 def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:

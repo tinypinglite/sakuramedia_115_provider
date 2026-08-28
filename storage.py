@@ -53,17 +53,17 @@ from .hls_reader import Cloud115HlsSegmentReader
 from .playback import Cloud115Playback
 from .range_reader import Cloud115RangeReader
 
+_BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
 REF_VERSION = 1
 DIR_REF_KIND = "cloud115_dir"
 ENTRY_REF_KIND = "cloud115_entry"
 MEDIA_REF_KIND = "cloud115_media"
 STAGE_RECEIPT_KIND = "cloud115_stage"
-THUMBNAIL_USER_AGENT = "Mozilla/5.0 SakuraMedia-115-Thumbnail/1.0"
 THUMBNAIL_INTERVAL_SECONDS = 10
 THUMBNAIL_HLS_MAX_WORKERS = 3
 THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL = 50
 THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS = 5
-CLIP_USER_AGENT = "Mozilla/5.0 SakuraMedia-115-Clip/1.0"
+COVER_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 _HASH_DOMAIN = b"media-file-hash-v1"
 _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
 _HASH_MIDDLE_BYTES = 1024 * 1024
@@ -221,7 +221,7 @@ class Cloud115StorageProvider:
             async with Cloud115Client(self._device_cookie) as client:
                 return await client.download_bytes(
                     entry.pickcode,
-                    user_agent=THUMBNAIL_USER_AGENT,
+                    user_agent=_BROWSER_USER_AGENT,
                     max_bytes=20 * 1024 * 1024,
                 )
 
@@ -381,7 +381,8 @@ class Cloud115StorageProvider:
             async with Cloud115Client(self._device_cookie) as client:
                 await asyncio.sleep(random.uniform(*_HASH_REQUEST_DELAY_RANGE))
                 return await client.get_download_url(
-                    entry.pickcode, user_agent=THUMBNAIL_USER_AGENT
+                    entry.pickcode,
+                    user_agent=_BROWSER_USER_AGENT,
                 )
 
         try:
@@ -461,6 +462,13 @@ class Cloud115StorageProvider:
 
     async def handle_playback(self, *, media: MediaHandle, context: PlaybackContext) -> Response:
         return await self._playback.handle(media=media, context=context)
+
+    def open_cover_source(self, *, media: MediaHandle) -> Cloud115RangeReader:
+        return self._range_reader(
+            media,
+            operation="open_cover_source",
+            max_fetched_bytes=COVER_MAX_FETCHED_BYTES,
+        )
 
     def generate_thumbnails(self, *, media: MediaHandle, workspace: Path) -> ThumbnailGeneration:
         try:
@@ -579,9 +587,7 @@ class Cloud115StorageProvider:
         self, media: MediaHandle
     ) -> tuple[list[tuple[Cloud115VideoSegment, list[int]]], int]:
         entry = _media_entry(media.storage_ref, operation="generate_thumbnails")
-        async with Cloud115Client(
-            self._device_cookie, user_agent=THUMBNAIL_USER_AGENT
-        ) as client:
+        async with Cloud115Client(self._device_cookie) as client:
             info = await client.get_video_info(entry.pickcode)
             segments = await client.get_video_segments(
                 choose_hls_definition(info.definitions, lowest=True)
@@ -597,7 +603,10 @@ class Cloud115StorageProvider:
         av,
         image_module,
     ) -> list[ThumbnailArtifact]:
-        reader = Cloud115HlsSegmentReader(segment.url, user_agent=THUMBNAIL_USER_AGENT)
+        reader = Cloud115HlsSegmentReader(
+            segment.url,
+            user_agent=_BROWSER_USER_AGENT,
+        )
         container = None
         try:
             container = av.open(
@@ -654,7 +663,6 @@ class Cloud115StorageProvider:
         reader = self._range_reader(
             media,
             operation="create_clip",
-            user_agent=CLIP_USER_AGENT,
             max_fetched_bytes=1024 * 1024 * 1024,
         )
         input_container = None
@@ -720,14 +728,16 @@ class Cloud115StorageProvider:
         media: MediaHandle,
         *,
         operation: str,
-        user_agent: str,
         max_fetched_bytes: int,
     ) -> Cloud115RangeReader:
         entry = _media_entry(media.storage_ref, operation=operation)
 
         async def resolve():
             async with Cloud115Client(self._device_cookie) as client:
-                return await client.get_download_url(entry.pickcode, user_agent=user_agent)
+                return await client.get_download_url(
+                    entry.pickcode,
+                    user_agent=_BROWSER_USER_AGENT,
+                )
 
         try:
             direct = run_sync(resolve())
