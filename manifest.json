@@ -1,9 +1,10 @@
 {
   "plugin_id": "sakuramedia_115_provider",
   "display_name": "115 网盘",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "host_api_version": 4,
   "requires_python": ">=3.10,<3.11",
   "dependencies": [],
-  "author": "SakuraMedia"
+  "author": "SakuraMedia",
+  "release_api_url": "https://api.github.com/repos/tinypinglite/sakuramedia_115_provider/releases/latest"
 }
