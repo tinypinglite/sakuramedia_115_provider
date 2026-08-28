@@ -29,7 +29,7 @@ from .offline import Cloud115OfflineDownloadComponent
 
 PLUGIN_ID = "sakuramedia_115_provider"
 DISPLAY_NAME = "115 网盘"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(

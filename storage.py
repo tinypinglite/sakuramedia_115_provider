@@ -149,6 +149,25 @@ class Cloud115StorageProvider:
         except ValueError as exc:
             raise _error("scan_import_source", "source_not_found", "115 导入源无效") from exc
 
+    def scan_media_refs(self, *, source_ref: JsonObject) -> tuple[JsonObject, ...]:
+        """Enumerate native media refs without rebuilding import-relative paths."""
+        try:
+            cid = _directory_ref(source_ref, operation="scan_media_refs")
+
+            async def scan() -> tuple[JsonObject, ...]:
+                async with Cloud115Client(self._device_cookie) as client:
+                    refs = [
+                        _media_ref(entry)
+                        async for entry in client.iter_files_recursive(cid)
+                    ]
+                    return tuple(refs)
+
+            return run_sync(scan())
+        except Cloud115Error as exc:
+            raise _cloud_error("scan_media_refs", exc) from exc
+        except ValueError as exc:
+            raise _error("scan_media_refs", "source_not_found", "115 扫描源无效") from exc
+
     async def _scan_dir(self, root_cid: str) -> list[ImportFile]:
         async with Cloud115Client(self._device_cookie) as client:
             source_entries = [entry async for entry in client.iter_files_recursive(root_cid)]

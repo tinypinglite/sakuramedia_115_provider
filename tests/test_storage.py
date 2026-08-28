@@ -151,6 +151,38 @@ def test_scan_import_source_rebuilds_nested_relative_path(monkeypatch, tmp_path)
     assert ScanClient.directory_info_calls == ["deep"]
 
 
+def test_scan_media_refs_skips_relative_path_queries(monkeypatch, tmp_path) -> None:
+    ScanClient.recursive_entries = (
+        Cloud115Entry("movie", "deep", "ABC-001.mp4", False, 99, "sha", "pc", 0, True),
+    )
+    ScanClient.root_entries = ()
+    ScanClient.recursive_calls = []
+    ScanClient.list_calls = []
+    ScanClient.directory_info_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    refs = _scan_provider(tmp_path).scan_media_refs(
+        source_ref={"version": 1, "kind": "cloud115_dir", "cid": "source"}
+    )
+
+    assert refs == (
+        {
+            "version": 1,
+            "kind": "cloud115_media",
+            "fid": "movie",
+            "parent_cid": "deep",
+            "pickcode": "pc",
+            "name": "ABC-001.mp4",
+            "size_bytes": 99,
+            "sha1": "sha",
+            "is_dir": False,
+        },
+    )
+    assert ScanClient.recursive_calls == ["source"]
+    assert ScanClient.list_calls == []
+    assert ScanClient.directory_info_calls == []
+
+
 def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch, tmp_path) -> None:
     async def ensure(_client, *, parent_cid: str, name: str) -> str:
         cid = f"{parent_cid}/{name}"
