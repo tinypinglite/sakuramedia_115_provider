@@ -41,6 +41,9 @@ from .exceptions import (
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
 _DIRECT_URL_CACHE_TTL_SECONDS = 6 * 60 * 60
 _HLS_PATH = re.compile(r"^hls/([A-Za-z0-9_-]{16,})/segment/(\d+)\.ts$")
+_MERGED_HLS_PATH = re.compile(
+    r"^merged-hls/([A-Za-z0-9_-]{16,})/part/(\d+)/segment/(\d+)\.ts$"
+)
 _ONE_RANGE = re.compile(r"^bytes=(?:\d+-\d*|\d*-\d+)$")
 _RELAY_HEADERS = frozenset(
     {
@@ -73,12 +76,24 @@ class _HlsEntry:
     usable_until: float
 
 
+@dataclass(slots=True)
+class _MergedHlsEntry:
+    token: str
+    library_id: int
+    media_ids: tuple[int, ...]
+    credential_fingerprint: str
+    pickcodes: tuple[str, ...]
+    segments_by_part: tuple[tuple[Cloud115VideoSegment, ...], ...]
+    usable_until: float
+
+
 class _PlaybackCache:
     """Bounded, process-local cache.  It never writes signed 115 URLs to disk."""
 
     def __init__(self) -> None:
         self._direct: OrderedDict[tuple[object, ...], _DirectEntry] = OrderedDict()
         self._hls: OrderedDict[str, _HlsEntry] = OrderedDict()
+        self._merged_hls: OrderedDict[str, _MergedHlsEntry] = OrderedDict()
 
     def direct_for(self, key: tuple[object, ...]) -> _DirectEntry | None:
         entry = self._direct.get(key)
@@ -152,6 +167,61 @@ class _PlaybackCache:
         entry.segments = segments
         entry.usable_until = time.monotonic() + 15 * 60
 
+    def put_merged_hls(
+        self,
+        *,
+        library_id: int,
+        media_ids: tuple[int, ...],
+        credential_fingerprint: str,
+        pickcodes: tuple[str, ...],
+        segments_by_part: tuple[tuple[Cloud115VideoSegment, ...], ...],
+    ) -> _MergedHlsEntry:
+        entry = _MergedHlsEntry(
+            token=secrets.token_urlsafe(18),
+            library_id=library_id,
+            media_ids=media_ids,
+            credential_fingerprint=credential_fingerprint,
+            pickcodes=pickcodes,
+            segments_by_part=segments_by_part,
+            usable_until=time.monotonic() + 15 * 60,
+        )
+        self._merged_hls[entry.token] = entry
+        while len(self._merged_hls) > 64:
+            self._merged_hls.popitem(last=False)
+        return entry
+
+    def merged_hls_for(
+        self,
+        token: str,
+        *,
+        library_id: int,
+        media_ids: tuple[int, ...],
+        credential_fingerprint: str,
+    ) -> _MergedHlsEntry | None:
+        entry = self._merged_hls.get(token)
+        if entry is None or entry.usable_until <= time.monotonic():
+            self._merged_hls.pop(token, None)
+            return None
+        if (
+            entry.library_id != library_id
+            or entry.media_ids != media_ids
+            or entry.credential_fingerprint != credential_fingerprint
+        ):
+            return None
+        self._merged_hls.move_to_end(token)
+        return entry
+
+    def refresh_merged_hls_part(
+        self,
+        entry: _MergedHlsEntry,
+        part_index: int,
+        segments: tuple[Cloud115VideoSegment, ...],
+    ) -> None:
+        updated_parts = list(entry.segments_by_part)
+        updated_parts[part_index] = segments
+        entry.segments_by_part = tuple(updated_parts)
+        entry.usable_until = time.monotonic() + 15 * 60
+
 
 _CACHE = _PlaybackCache()
 
@@ -174,6 +244,35 @@ class Cloud115Playback:
         if context.delivery == "redirect":
             return await self._redirect(media=media, pickcode=pickcode, context=context)
         return await self._proxy_root(media=media, pickcode=pickcode, context=context)
+
+    async def handle_merged(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        context: PlaybackContext,
+    ) -> Response:
+        if len(medias) < 2:
+            raise _provider_error(
+                "merged_playback", "unsupported", "合并播放至少需要 2 个分段"
+            )
+        pickcodes = tuple(
+            self._pickcode(media, operation="merged_playback") for media in medias
+        )
+        if context.resource_path == "index.m3u8":
+            try:
+                entry = await self._resolve_merged_hls(medias=medias, pickcodes=pickcodes)
+            except Cloud115Error as exc:
+                raise _cloud_error("merged_playback", exc) from exc
+            return PlainTextResponse(
+                self._render_merged_hls_playlist(entry, context),
+                media_type="application/vnd.apple.mpegurl",
+                headers={"Cache-Control": "no-store"},
+            )
+        return await self._merged_hls_segment(
+            medias=medias,
+            pickcodes=pickcodes,
+            context=context,
+        )
 
     async def _redirect(
         self, *, media: MediaHandle, pickcode: str, context: PlaybackContext
@@ -242,6 +341,30 @@ class Cloud115Playback:
             segments=segments,
         )
 
+    async def _resolve_merged_hls(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        pickcodes: tuple[str, ...],
+    ) -> _MergedHlsEntry:
+        segments_by_part: list[tuple[Cloud115VideoSegment, ...]] = []
+        async with Cloud115Client(self._device_cookie) as client:
+            for pickcode in pickcodes:
+                info = await client.get_video_info(pickcode)
+                segments = await client.get_video_segments(
+                    choose_hls_definition(info.definitions)
+                )
+                if not segments:
+                    raise Cloud115RequestError("115 HLS 分片为空")
+                segments_by_part.append(segments)
+        return _CACHE.put_merged_hls(
+            library_id=medias[0].library.library_id,
+            media_ids=tuple(media.media_id for media in medias),
+            credential_fingerprint=self._credential_fingerprint,
+            pickcodes=pickcodes,
+            segments_by_part=tuple(segments_by_part),
+        )
+
     async def _hls_segment(
         self, *, media: MediaHandle, context: PlaybackContext, pickcode: str
     ) -> Response:
@@ -291,6 +414,69 @@ class Cloud115Playback:
             raise _cloud_error("playback", exc) from exc
         except _UpstreamStatus as exc:
             raise _provider_error("playback", "unavailable", "115 HLS 分片读取失败", retryable=True) from exc
+
+    async def _merged_hls_segment(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        pickcodes: tuple[str, ...],
+        context: PlaybackContext,
+    ) -> Response:
+        match = _MERGED_HLS_PATH.fullmatch(context.resource_path or "")
+        if match is None:
+            raise _provider_error("merged_playback", "source_not_found", "115 合并播放资源不存在")
+        entry = _CACHE.merged_hls_for(
+            match.group(1),
+            library_id=medias[0].library.library_id,
+            media_ids=tuple(media.media_id for media in medias),
+            credential_fingerprint=self._credential_fingerprint,
+        )
+        if entry is None or entry.pickcodes != pickcodes:
+            raise _provider_error(
+                "merged_playback", "unavailable", "115 合并 HLS 播放列表已过期", retryable=True
+            )
+        part_index = int(match.group(2))
+        segment_index = int(match.group(3))
+        if part_index >= len(entry.segments_by_part):
+            raise _provider_error("merged_playback", "source_not_found", "115 合并分段不存在")
+        segments = entry.segments_by_part[part_index]
+        if segment_index >= len(segments):
+            raise _provider_error("merged_playback", "source_not_found", "115 HLS 分片不存在")
+        try:
+            return await self._external_relay(
+                url=segments[segment_index].url,
+                user_agent=_BROWSER_USER_AGENT,
+                request=context,
+                lease=None,
+            )
+        except _UpstreamStatus as exc:
+            if exc.status_code not in {401, 403, 404}:
+                raise _provider_error(
+                    "merged_playback", "unavailable", "115 HLS 分片读取失败", retryable=True
+                ) from exc
+        except Cloud115RequestError:
+            pass
+        try:
+            async with Cloud115Client(self._device_cookie) as client:
+                info = await client.get_video_info(pickcodes[part_index])
+                refreshed_segments = await client.get_video_segments(
+                    choose_hls_definition(info.definitions)
+                )
+            if not refreshed_segments or segment_index >= len(refreshed_segments):
+                raise Cloud115NotFoundError("115 HLS 分片不存在")
+            _CACHE.refresh_merged_hls_part(entry, part_index, refreshed_segments)
+            return await self._external_relay(
+                url=refreshed_segments[segment_index].url,
+                user_agent=_BROWSER_USER_AGENT,
+                request=context,
+                lease=None,
+            )
+        except Cloud115Error as exc:
+            raise _cloud_error("merged_playback", exc) from exc
+        except _UpstreamStatus as exc:
+            raise _provider_error(
+                "merged_playback", "unavailable", "115 HLS 分片读取失败", retryable=True
+            ) from exc
 
     async def _direct_relay(
         self, *, media: MediaHandle, pickcode: str, context: PlaybackContext
@@ -411,6 +597,39 @@ class Cloud115Playback:
         for segment in entry.segments:
             lines.append(f"#EXTINF:{segment.duration_seconds:.3f},")
             lines.append(context.url_for(f"hls/{entry.token}/segment/{segment.index}.ts"))
+        lines.append("#EXT-X-ENDLIST")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _render_merged_hls_playlist(
+        entry: _MergedHlsEntry, context: PlaybackContext
+    ) -> str:
+        target_duration = max(
+            1,
+            math.ceil(
+                max(
+                    segment.duration_seconds
+                    for segments in entry.segments_by_part
+                    for segment in segments
+                )
+            ),
+        )
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+        ]
+        for part_index, segments in enumerate(entry.segments_by_part):
+            if part_index:
+                lines.append("#EXT-X-DISCONTINUITY")
+            for segment in segments:
+                lines.append(f"#EXTINF:{segment.duration_seconds:.3f},")
+                lines.append(
+                    context.url_for(
+                        f"merged-hls/{entry.token}/part/{part_index}/segment/{segment.index}.ts"
+                    )
+                )
         lines.append("#EXT-X-ENDLIST")
         return "\n".join(lines) + "\n"
 

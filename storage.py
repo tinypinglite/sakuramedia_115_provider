@@ -463,6 +463,14 @@ class Cloud115StorageProvider:
     async def handle_playback(self, *, media: MediaHandle, context: PlaybackContext) -> Response:
         return await self._playback.handle(media=media, context=context)
 
+    async def handle_merged_playback(
+        self,
+        *,
+        medias: tuple[MediaHandle, ...],
+        context: PlaybackContext,
+    ) -> Response:
+        return await self._playback.handle_merged(medias=medias, context=context)
+
     def open_cover_source(self, *, media: MediaHandle) -> Cloud115RangeReader:
         return self._range_reader(
             media,

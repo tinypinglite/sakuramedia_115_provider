@@ -187,3 +187,43 @@ def test_hls_segment_refreshes_definition_once(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert relay_calls == ["https://hls/0.ts", "https://hls/0.ts"]
+
+
+def test_merged_hls_playlist_concatenates_parts_with_discontinuity(monkeypatch) -> None:
+    FakeClient.fail_hls = False
+    seen_urls: list[str] = []
+
+    async def relay(self, *, url, user_agent, request, lease):
+        seen_urls.append(url)
+        return Response(status_code=200)
+
+    monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(playback.Cloud115Playback, "_external_relay", relay)
+    player = playback.Cloud115Playback(device_cookie="merged-hls-cookie")
+    medias = (_media(10), _media(11))
+    root = asyncio.run(
+        player.handle_merged(
+            medias=medias,
+            context=_context(delivery="proxy", resource_path="index.m3u8"),
+        )
+    )
+
+    playlist = root.body.decode()
+    assert root.media_type == "application/vnd.apple.mpegurl"
+    assert playlist.count("#EXTINF") == 4
+    assert playlist.count("#EXT-X-DISCONTINUITY") == 1
+    child_path = next(
+        line.split("/play/", 1)[1].split("?", 1)[0]
+        for line in playlist.splitlines()
+        if "/part/1/segment/0.ts" in line
+    )
+
+    response = asyncio.run(
+        player.handle_merged(
+            medias=medias,
+            context=_context(delivery="proxy", resource_path=child_path),
+        )
+    )
+
+    assert response.status_code == 200
+    assert seen_urls == ["https://hls/0.ts"]

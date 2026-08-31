@@ -29,7 +29,7 @@ from .offline import Cloud115OfflineDownloadComponent
 
 PLUGIN_ID = "sakuramedia_115_provider"
 DISPLAY_NAME = "115 网盘"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
@@ -93,6 +93,7 @@ class Cloud115MediaProviderBundle:
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
     playback_deliveries = ("proxy", "redirect")
+    merged_playback_format = "hls"
 
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
