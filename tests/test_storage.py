@@ -9,9 +9,11 @@ from sakuramedia_115_provider.cloud115 import (
     Cloud115DirectoryInfo,
     Cloud115DirectUrl,
     Cloud115Entry,
+    Cloud115VideoDefinition,
+    Cloud115VideoInfo,
     Cloud115VideoSegment,
 )
-
+from sakuramedia_115_provider.exceptions import Cloud115VideoUnavailableError
 from src.plugins.provider_protocol import (
     ImportFile,
     ImportPlacement,
@@ -48,6 +50,21 @@ class FakeClient:
     async def delete_files(self, _file_ids, *, parent_cid: str | None = None) -> None:
         if parent_cid:
             type(self).entries[parent_cid] = []
+
+    async def get_video_info(self, _pickcode: str) -> Cloud115VideoInfo:
+        return Cloud115VideoInfo(
+            definitions=(
+                Cloud115VideoDefinition(1, "1920x1080", "原画", "https://hls.example/video.m3u8"),
+            )
+        )
+
+    async def get_video_segments(
+        self, _definition: Cloud115VideoDefinition
+    ) -> tuple[Cloud115VideoSegment, ...]:
+        return (
+            Cloud115VideoSegment(0, "https://hls.example/0.ts", 10.4),
+            Cloud115VideoSegment(1, "https://hls.example/1.ts", 20.6),
+        )
 
 
 class ScanClient:
@@ -227,9 +244,78 @@ def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch,
 
     assert staged.storage_ref["kind"] == "cloud115_media"
     assert staged.storage_ref["pickcode"] == "target-pc"
+    assert staged.duration_seconds == 31
+    assert provider.probe_duration_seconds(
+        media=MediaHandle(
+            media_id=1,
+            library=library,
+            storage_ref=staged.storage_ref,
+            file_name="movie.mp4",
+            file_size_bytes=99,
+            duration_seconds=0,
+        )
+    ) == 31
     provider.abort_import(receipt=staged.receipt)
     target_dir = staged.receipt["target_parent_cid"]
     assert FakeClient.entries[target_dir] == []
+
+
+def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
+    monkeypatch, tmp_path
+) -> None:
+    created_directories: list[tuple[str, str]] = []
+
+    async def ensure(_client, *, parent_cid: str, name: str) -> str:
+        created_directories.append((parent_cid, name))
+        return f"{parent_cid}/{name}"
+
+    async def unavailable(_client, _entry) -> int:
+        raise Cloud115VideoUnavailableError("115 视频转码尚未就绪")
+
+    FakeClient.entries = {}
+    monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
+    monkeypatch.setattr(
+        storage.Cloud115StorageProvider,
+        "_probe_duration_with_client",
+        staticmethod(unavailable),
+    )
+    library = LibraryHandle(
+        1,
+        "cloud115",
+        {"device_cookie": "cookie", "media_root_cid": "media"},
+        "123",
+    )
+    provider = storage.Cloud115StorageProvider(library=library, data_dir=tmp_path)
+    source = ImportFile(
+        source_ref={
+            "version": 1,
+            "kind": "cloud115_entry",
+            "fid": "source-fid",
+            "parent_cid": "source-parent",
+            "pickcode": "source-pc",
+            "name": "movie.mp4",
+            "size_bytes": 99,
+            "sha1": "sha",
+            "is_dir": False,
+        },
+        name="movie.mp4",
+        relative_path="movie.mp4",
+        size_bytes=99,
+        is_video=True,
+    )
+
+    with pytest.raises(ProviderOperationError, match="115 服务暂不可用") as exc_info:
+        provider.stage_import_file(
+            source=source,
+            placement=ImportPlacement(relative_path="jav/ABC-001/movie.mp4"),
+            source_disposition="keep",
+            operation_key="import:1",
+        )
+
+    assert exc_info.value.code == "unavailable"
+    assert created_directories == []
+    assert FakeClient.entries == {}
 
 
 class HashClient:

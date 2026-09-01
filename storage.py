@@ -13,8 +13,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from loguru import logger
-from starlette.responses import Response
-
 from src.plugins.provider_protocol import (
     BrowseEntry,
     BrowsePage,
@@ -33,6 +31,7 @@ from src.plugins.provider_protocol import (
     ThumbnailGeneration,
     ThumbnailGenerationDeferred,
 )
+from starlette.responses import Response
 
 from .cloud115 import (
     Cloud115Client,
@@ -292,6 +291,7 @@ class Cloud115StorageProvider:
         source_disposition: str,
     ) -> StagedMedia:
         async with Cloud115Client(self._device_cookie) as client:
+            duration_seconds = await self._probe_duration_with_client(client, source_entry)
             target_parent = self._media_root_cid
             for component in placement_parts[:-1]:
                 target_parent = await find_or_create_subdir(
@@ -329,9 +329,33 @@ class Cloud115StorageProvider:
                 "target_pickcode": target_entry.pickcode,
             },
             size_bytes=target_entry.size_bytes,
-            duration_seconds=None,
+            duration_seconds=duration_seconds,
             video_info=None,
         )
+
+    def probe_duration_seconds(self, *, media: MediaHandle) -> int:
+        entry = _media_entry(media.storage_ref, operation="probe_duration_seconds")
+        try:
+            return run_sync(self._probe_duration(entry))
+        except Cloud115Error as exc:
+            raise _cloud_error("probe_duration_seconds", exc) from exc
+
+    async def _probe_duration(self, entry: Cloud115Entry) -> int:
+        async with Cloud115Client(self._device_cookie) as client:
+            return await self._probe_duration_with_client(client, entry)
+
+    @staticmethod
+    async def _probe_duration_with_client(
+        client: Cloud115Client, entry: Cloud115Entry
+    ) -> int:
+        info = await client.get_video_info(entry.pickcode)
+        segments = await client.get_video_segments(choose_hls_definition(info.definitions))
+        duration_seconds = int(
+            sum(segment.duration_seconds for segment in segments) + 1e-6
+        )
+        if duration_seconds <= 0:
+            raise Cloud115VideoUnavailableError("115 视频时长不可用")
+        return duration_seconds
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
         _stage_receipt(receipt, operation="finalize_import")
