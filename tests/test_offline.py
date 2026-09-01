@@ -173,5 +173,5 @@ def test_offline_submission_rejects_existing_task_outside_managed_directory(monk
             )
         )
 
-    assert error.value.code == "source_not_found"
+    assert error.value.code == "task_not_managed"
     assert error.value.safe_message == "同哈希离线任务已存在，但不在当前下载目录，当前下载器无法接管"

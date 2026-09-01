@@ -212,7 +212,7 @@ class Cloud115OfflineDownloadProvider:
                             return existing.info_hash
                     raise _error(
                         "submit_download",
-                        "source_not_found",
+                        "task_not_managed",
                         "同哈希离线任务已存在，但不在当前下载目录，当前下载器无法接管",
                     )
 
