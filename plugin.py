@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path, PurePosixPath
 
 from src.plugins import (
@@ -29,7 +30,9 @@ from .offline import Cloud115OfflineDownloadComponent
 
 PLUGIN_ID = "sakuramedia_115_provider"
 DISPLAY_NAME = "115 网盘"
-VERSION = "0.1.10"
+VERSION = json.loads(
+    Path(__file__).with_name("manifest.json").read_text(encoding="utf-8")
+)["version"]
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
