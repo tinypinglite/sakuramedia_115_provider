@@ -530,6 +530,11 @@ class Cloud115Playback:
                 client.build_request(request.request.method, url, headers=headers),
                 stream=True,
             )
+        except asyncio.CancelledError:
+            await client.aclose()
+            if lease is not None:
+                lease.release()
+            raise
         except httpx.RequestError as exc:
             await client.aclose()
             if lease is not None:

@@ -121,6 +121,41 @@ def test_proxy_falls_back_to_fixed_ua_range_relay(monkeypatch) -> None:
     assert FakeClient.download_user_agents == [Cloud115Client.DEFAULT_USER_AGENT]
 
 
+def test_external_relay_releases_lease_when_connect_is_cancelled(monkeypatch) -> None:
+    closed: list[bool] = []
+
+    class CancelledClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def build_request(self, *_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, *, stream: bool) -> None:
+            raise asyncio.CancelledError
+
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(playback.httpx, "AsyncClient", CancelledClient)
+
+    async def call_relay() -> tuple[bool, bool]:
+        lease = asyncio.Semaphore(1)
+        try:
+            await playback.Cloud115Playback(device_cookie="cookie")._external_relay(
+                url="https://direct/file",
+                user_agent="player-ua",
+                request=_context(delivery="proxy"),
+                lease=lease,
+            )
+        except asyncio.CancelledError:
+            return True, not lease.locked()
+        return False, not lease.locked()
+
+    assert asyncio.run(call_relay()) == (True, True)
+    assert closed == [True]
+
+
 def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
     FakeClient.fail_hls = False
     FakeClient.download_user_agents.clear()
