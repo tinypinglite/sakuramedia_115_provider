@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar
 
 import pytest
@@ -140,6 +141,63 @@ def test_scan_import_source_skips_historical_empty_directories(monkeypatch, tmp_
     assert ScanClient.recursive_calls == ["source"]
     assert ScanClient.list_calls == [("source", 0, 1150)]
     assert ScanClient.directory_info_calls == []
+
+
+def test_import_source_identity_tracks_115_source_location_and_content(
+    tmp_path,
+) -> None:
+    provider = _scan_provider(tmp_path)
+    source = ImportFile(
+        source_ref={
+            "version": 1,
+            "kind": "cloud115_entry",
+            "fid": "source-fid",
+            "parent_cid": "source-parent",
+            "pickcode": "source-pc",
+            "name": "movie.mp4",
+            "size_bytes": 99,
+            "sha1": "source-sha",
+            "is_dir": False,
+        },
+        name="movie.mp4",
+        relative_path="folder/movie.mp4",
+        size_bytes=99,
+        is_video=True,
+    )
+
+    identity = provider.get_import_source_identity(source=source)
+    assert provider.get_import_source_identity(source=source) == identity
+    assert (
+        provider.get_import_source_identity(
+            source=replace(
+                source, source_ref={**source.source_ref, "parent_cid": "new-parent"}
+            )
+        )
+        != identity
+    )
+    assert (
+        provider.get_import_source_identity(
+            source=replace(
+                source,
+                source_ref={**source.source_ref, "name": "renamed.mp4"},
+                name="renamed.mp4",
+                relative_path="folder/renamed.mp4",
+            )
+        )
+        != identity
+    )
+    assert (
+        provider.get_import_source_identity(
+            source=replace(source, source_ref={**source.source_ref, "sha1": "changed-sha"})
+        )
+        != identity
+    )
+    assert (
+        provider.get_import_source_identity(
+            source=replace(source, source_ref={**source.source_ref, "sha1": ""})
+        )
+        is None
+    )
 
 
 def test_scan_import_source_rebuilds_nested_relative_path(monkeypatch, tmp_path) -> None:

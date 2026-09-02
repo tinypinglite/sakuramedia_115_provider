@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import random
 import time
@@ -150,6 +151,29 @@ class Cloud115StorageProvider:
             raise _cloud_error("scan_import_source", exc) from exc
         except ValueError as exc:
             raise _error("scan_import_source", "source_not_found", "115 导入源无效") from exc
+
+    def get_import_source_identity(self, *, source: ImportFile) -> str | None:
+        entry = _entry_ref(source.source_ref, operation="get_import_source_identity")
+        if entry.is_dir:
+            raise _error(
+                "get_import_source_identity", "source_not_found", "115 导入文件不存在"
+            )
+        if not entry.sha1:
+            return None
+        payload = json.dumps(
+            {
+                "fid": entry.entry_id,
+                "parent_cid": entry.parent_id,
+                "name": entry.name,
+                "relative_path": source.relative_path,
+                "size_bytes": entry.size_bytes,
+                "sha1": entry.sha1,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"cloud115-import-source-v1:{hashlib.sha256(payload).hexdigest()}"
 
     def scan_media_refs(self, *, source_ref: JsonObject) -> tuple[JsonObject, ...]:
         """Enumerate native media refs without rebuilding import-relative paths."""
