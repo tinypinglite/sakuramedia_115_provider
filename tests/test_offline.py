@@ -68,7 +68,7 @@ def test_offline_submission_uses_info_hash_directory(monkeypatch) -> None:
 
 
 def test_offline_submission_converts_torrent_to_magnet(monkeypatch) -> None:
-    monkeypatch.setattr(offline, "_download_torrent", lambda _url: b"torrent")
+    monkeypatch.setattr(offline, "_resolve_http_source", lambda _url: ("torrent", b"torrent"))
     monkeypatch.setattr(
         offline, "_torrent_info_hash", lambda _payload: "0123456789abcdef0123456789abcdef01234567"
     )
@@ -76,6 +76,35 @@ def test_offline_submission_converts_torrent_to_magnet(monkeypatch) -> None:
     magnet, info_hash = offline._resolve_source("https://index.example/movie.torrent")
 
     assert magnet == "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+    assert info_hash == "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_offline_submission_uses_magnet_from_torrent_redirect(monkeypatch) -> None:
+    magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+
+    class Response:
+        is_redirect = True
+        headers = {"location": magnet}
+
+    class HTTPClient:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs == {"timeout": 120.0, "follow_redirects": False, "trust_env": False}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, url: str) -> Response:
+            assert url == "https://index.example/movie.torrent"
+            return Response()
+
+    monkeypatch.setattr(offline.httpx, "Client", HTTPClient)
+
+    resolved_magnet, info_hash = offline._resolve_source("https://index.example/movie.torrent")
+
+    assert resolved_magnet == magnet
     assert info_hash == "0123456789abcdef0123456789abcdef01234567"
 
 

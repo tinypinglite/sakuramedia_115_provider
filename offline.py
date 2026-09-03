@@ -5,7 +5,8 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from urllib.parse import unquote, urlsplit
+from typing import Literal
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -33,6 +34,7 @@ OFFLINE_REF_VERSION = 1
 OFFLINE_SOURCE_KIND = "cloud115_dir"
 _BTIH_RE = re.compile(r"urn:btih:([A-Za-z0-9]+)", re.IGNORECASE)
 _INFO_HASH_DIR_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_HTTP_REDIRECTS = 5
 
 
 def _canonical_btih(value: str) -> str:
@@ -67,14 +69,28 @@ def _parse_magnet(value: str) -> tuple[str, str]:
     return magnet, _canonical_btih(match.group(1))
 
 
-def _download_torrent(url: str) -> bytes:
+def _resolve_http_source(url: str) -> tuple[Literal["magnet", "torrent"], str | bytes]:
     parsed = urlsplit(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError("invalid torrent url")
-    with httpx.Client(timeout=120.0, follow_redirects=True, trust_env=False) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        return response.content
+    with httpx.Client(timeout=120.0, follow_redirects=False, trust_env=False) as client:
+        request_url = url
+        for _ in range(MAX_HTTP_REDIRECTS):
+            response = client.get(request_url)
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("invalid torrent redirect")
+                request_url = urljoin(request_url, location)
+                if request_url.lower().startswith("magnet:"):
+                    return "magnet", request_url
+                parsed = urlsplit(request_url)
+                if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError("invalid torrent redirect")
+                continue
+            response.raise_for_status()
+            return "torrent", response.content
+    raise ValueError("too many torrent redirects")
 
 
 def _torrent_info_hash(payload: bytes) -> str:
@@ -93,7 +109,10 @@ def _resolve_source(source_uri: str) -> tuple[str, str]:
         except ValueError as exc:
             raise _error("submit_download", "invalid_config", "磁力链接无效") from exc
     try:
-        info_hash = _torrent_info_hash(_download_torrent(source_uri))
+        source_kind, payload = _resolve_http_source(source_uri)
+        if source_kind == "magnet":
+            return _parse_magnet(payload)
+        info_hash = _torrent_info_hash(payload)
     except ValueError as exc:
         raise _error("submit_download", "invalid_config", "种子文件无效") from exc
     except httpx.HTTPStatusError as exc:
