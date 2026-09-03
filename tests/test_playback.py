@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
+import pytest
 from sakuramedia_115_provider import playback
 from sakuramedia_115_provider.cloud115 import (
     Cloud115Client,
@@ -156,6 +158,63 @@ def test_external_relay_releases_lease_when_connect_is_cancelled(monkeypatch) ->
     assert closed == [True]
 
 
+def test_hls_relay_ignores_range_and_rejects_partial_segments(monkeypatch) -> None:
+    seen_ranges: list[str | None] = []
+    status_code = 200
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_ranges.append(request.headers.get("range"))
+        return httpx.Response(
+            status_code,
+            content=b"ts",
+            headers={"Content-Type": "video/mp2t", "Content-Range": "bytes 0-1/2"},
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    class RelayClient(real_async_client):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(transport=transport, **kwargs)
+
+    monkeypatch.setattr(playback.httpx, "AsyncClient", RelayClient)
+    player = playback.Cloud115Playback(device_cookie="hls-range-cookie")
+    context = _context(delivery="proxy", range_header="bytes=0-9")
+
+    response = asyncio.run(
+        player._external_relay(
+            url="https://hls/0.ts",
+            user_agent="player-ua",
+            request=context,
+            lease=None,
+            forward_range=False,
+        )
+    )
+
+    async def read_body() -> bytes:
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "content-range" not in response.headers
+    assert asyncio.run(read_body()) == b"ts"
+    assert seen_ranges == [None]
+
+    status_code = 206
+    with pytest.raises(playback._UpstreamStatus) as exc_info:
+        asyncio.run(
+            player._external_relay(
+                url="https://hls/0.ts",
+                user_agent="player-ua",
+                request=context,
+                lease=None,
+                forward_range=False,
+            )
+        )
+    assert exc_info.value.status_code == 206
+    assert seen_ranges == [None, None]
+
+
 def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
     FakeClient.fail_hls = False
     FakeClient.download_user_agents.clear()
@@ -198,10 +257,10 @@ def test_direct_cache_uses_six_hour_ttl(monkeypatch) -> None:
 
 def test_hls_segment_refreshes_definition_once(monkeypatch) -> None:
     FakeClient.fail_hls = False
-    relay_calls: list[str] = []
+    relay_calls: list[tuple[str, bool]] = []
 
-    async def relay(self, *, url, user_agent, request, lease):
-        relay_calls.append(url)
+    async def relay(self, *, url, user_agent, request, lease, forward_range=True):
+        relay_calls.append((url, forward_range))
         if len(relay_calls) == 1:
             raise playback._UpstreamStatus(403)
         return Response(status_code=200)
@@ -221,15 +280,15 @@ def test_hls_segment_refreshes_definition_once(monkeypatch) -> None:
     )
 
     assert response.status_code == 200
-    assert relay_calls == ["https://hls/0.ts", "https://hls/0.ts"]
+    assert relay_calls == [("https://hls/0.ts", False), ("https://hls/0.ts", False)]
 
 
 def test_merged_hls_playlist_concatenates_parts_with_discontinuity(monkeypatch) -> None:
     FakeClient.fail_hls = False
-    seen_urls: list[str] = []
+    seen_calls: list[tuple[str, bool]] = []
 
-    async def relay(self, *, url, user_agent, request, lease):
-        seen_urls.append(url)
+    async def relay(self, *, url, user_agent, request, lease, forward_range=True):
+        seen_calls.append((url, forward_range))
         return Response(status_code=200)
 
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
@@ -261,4 +320,4 @@ def test_merged_hls_playlist_concatenates_parts_with_discontinuity(monkeypatch) 
     )
 
     assert response.status_code == 200
-    assert seen_urls == ["https://hls/0.ts"]
+    assert seen_calls == [("https://hls/0.ts", False)]

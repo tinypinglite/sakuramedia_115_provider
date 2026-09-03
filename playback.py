@@ -388,6 +388,7 @@ class Cloud115Playback:
                 user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
+                forward_range=False,
             )
         except _UpstreamStatus as exc:
             if exc.status_code not in {401, 403, 404}:
@@ -409,6 +410,7 @@ class Cloud115Playback:
                 user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
+                forward_range=False,
             )
         except Cloud115Error as exc:
             raise _cloud_error("playback", exc) from exc
@@ -448,6 +450,7 @@ class Cloud115Playback:
                 user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
+                forward_range=False,
             )
         except _UpstreamStatus as exc:
             if exc.status_code not in {401, 403, 404}:
@@ -470,6 +473,7 @@ class Cloud115Playback:
                 user_agent=_BROWSER_USER_AGENT,
                 request=context,
                 lease=None,
+                forward_range=False,
             )
         except Cloud115Error as exc:
             raise _cloud_error("merged_playback", exc) from exc
@@ -517,12 +521,13 @@ class Cloud115Playback:
         user_agent: str,
         request: PlaybackContext,
         lease: asyncio.Semaphore | None,
+        forward_range: bool = True,
     ) -> Response:
         if lease is not None:
             await lease.acquire()
         client = httpx.AsyncClient(timeout=30.0, trust_env=False, follow_redirects=True)
         headers = {"User-Agent": user_agent, "Accept-Encoding": "identity"}
-        range_header = request.request.headers.get("range")
+        range_header = request.request.headers.get("range") if forward_range else None
         if range_header:
             headers["Range"] = range_header
         try:
@@ -540,18 +545,23 @@ class Cloud115Playback:
             if lease is not None:
                 lease.release()
             raise Cloud115RequestError("115 播放资源网络读取失败") from exc
-        if upstream.status_code not in {200, 206, 416}:
+        accepted_statuses = {200, 206, 416} if forward_range else {200}
+        if upstream.status_code not in accepted_statuses:
             status_code = upstream.status_code
             await upstream.aclose()
             await client.aclose()
             if lease is not None:
                 lease.release()
             raise _UpstreamStatus(status_code)
-        headers = {
-            key.title(): value
-            for key, value in upstream.headers.items()
-            if key.lower() in _RELAY_HEADERS
-        }
+        headers = (
+            {
+                key.title(): value
+                for key, value in upstream.headers.items()
+                if key.lower() in _RELAY_HEADERS
+            }
+            if forward_range
+            else {"Cache-Control": "no-store"}
+        )
         if upstream.status_code == 416 or request.request.method.upper() == "HEAD":
             await upstream.aclose()
             await client.aclose()
