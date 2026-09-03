@@ -90,6 +90,34 @@ _VIDEO_SUFFIXES = frozenset(
 )
 
 
+def _staged_media(
+    *,
+    storage_ref: JsonObject,
+    receipt: JsonObject,
+    size_bytes: int,
+    duration_seconds: int | None,
+    video_info: JsonObject | None,
+    resolution: str | None,
+) -> StagedMedia:
+    """Build a staged result for both pre- and post-resolution v4 hosts."""
+    if "resolution" in getattr(StagedMedia, "__dataclass_fields__", {}):
+        return StagedMedia(
+            storage_ref=storage_ref,
+            receipt=receipt,
+            size_bytes=size_bytes,
+            duration_seconds=duration_seconds,
+            video_info=video_info,
+            resolution=resolution,
+        )
+    return StagedMedia(
+        storage_ref=storage_ref,
+        receipt=receipt,
+        size_bytes=size_bytes,
+        duration_seconds=duration_seconds,
+        video_info=video_info,
+    )
+
+
 class Cloud115StorageProvider:
     def __init__(self, *, library: LibraryHandle, data_dir: Path) -> None:
         config = library.provider_config
@@ -315,7 +343,9 @@ class Cloud115StorageProvider:
         source_disposition: str,
     ) -> StagedMedia:
         async with Cloud115Client(self._device_cookie) as client:
-            duration_seconds = await self._probe_duration_with_client(client, source_entry)
+            duration_seconds, resolution = await self._probe_duration_and_resolution_with_client(
+                client, source_entry
+            )
             target_parent = self._media_root_cid
             for component in placement_parts[:-1]:
                 target_parent = await find_or_create_subdir(
@@ -340,7 +370,7 @@ class Cloud115StorageProvider:
                     await client.list_directory(target_dir), source_entry
                 )
         storage_ref = _media_ref(target_entry)
-        return StagedMedia(
+        return _staged_media(
             storage_ref=storage_ref,
             receipt={
                 "version": REF_VERSION,
@@ -355,6 +385,7 @@ class Cloud115StorageProvider:
             size_bytes=target_entry.size_bytes,
             duration_seconds=duration_seconds,
             video_info=None,
+            resolution=resolution,
         )
 
     def probe_duration_seconds(self, *, media: MediaHandle) -> int:
@@ -364,22 +395,50 @@ class Cloud115StorageProvider:
         except Cloud115Error as exc:
             raise _cloud_error("probe_duration_seconds", exc) from exc
 
+    def probe_resolution(self, *, media: MediaHandle) -> str | None:
+        entry = _media_entry(media.storage_ref, operation="probe_resolution")
+        try:
+            return run_sync(self._probe_resolution(entry))
+        except Cloud115Error as exc:
+            raise _cloud_error("probe_resolution", exc) from exc
+
     async def _probe_duration(self, entry: Cloud115Entry) -> int:
         async with Cloud115Client(self._device_cookie) as client:
             return await self._probe_duration_with_client(client, entry)
+
+    async def _probe_resolution(self, entry: Cloud115Entry) -> str | None:
+        async with Cloud115Client(self._device_cookie) as client:
+            return await self._probe_resolution_with_client(client, entry)
 
     @staticmethod
     async def _probe_duration_with_client(
         client: Cloud115Client, entry: Cloud115Entry
     ) -> int:
+        duration_seconds, _resolution = await Cloud115StorageProvider._probe_duration_and_resolution_with_client(
+            client, entry
+        )
+        return duration_seconds
+
+    @staticmethod
+    async def _probe_duration_and_resolution_with_client(
+        client: Cloud115Client, entry: Cloud115Entry
+    ) -> tuple[int, str | None]:
         info = await client.get_video_info(entry.pickcode)
-        segments = await client.get_video_segments(choose_hls_definition(info.definitions))
+        definition = choose_hls_definition(info.definitions)
+        segments = await client.get_video_segments(definition)
         duration_seconds = int(
             sum(segment.duration_seconds for segment in segments) + 1e-6
         )
         if duration_seconds <= 0:
             raise Cloud115VideoUnavailableError("115 视频时长不可用")
-        return duration_seconds
+        return duration_seconds, definition.resolution or None
+
+    @staticmethod
+    async def _probe_resolution_with_client(
+        client: Cloud115Client, entry: Cloud115Entry
+    ) -> str | None:
+        info = await client.get_video_info(entry.pickcode)
+        return choose_hls_definition(info.definitions).resolution or None
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
         _stage_receipt(receipt, operation="finalize_import")
