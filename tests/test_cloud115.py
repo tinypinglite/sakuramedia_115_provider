@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
+
 from sakuramedia_115_provider import cloud115
 from sakuramedia_115_provider.cipher import encrypt_downurl_payload
 from sakuramedia_115_provider.cloud115 import (
@@ -10,7 +12,11 @@ from sakuramedia_115_provider.cloud115 import (
     choose_hls_definition,
     exchange_web_cookie_for_alipaymini,
 )
-from sakuramedia_115_provider.exceptions import Cloud115OfflineTaskExistsError
+from sakuramedia_115_provider.exceptions import (
+    Cloud115AuthError,
+    Cloud115OfflineTaskExistsError,
+    Cloud115RiskControlError,
+)
 
 
 def test_downurl_request_codec_matches_fixed_protocol_vector() -> None:
@@ -82,6 +88,105 @@ def test_webapi_pacing_can_be_disabled(monkeypatch) -> None:
     asyncio.run(pace())
 
     assert sleep_delays == []
+
+
+def test_batch_webapi_pacing_waits_after_each_thirty_requests(monkeypatch) -> None:
+    intervals: list[tuple[float, float]] = []
+    sleep_delays: list[float] = []
+    now = [100.0]
+
+    def interval(low: float, high: float) -> float:
+        intervals.append((low, high))
+        return 1.0 if high == 3.0 else 17.0
+
+    async def sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
+    monkeypatch.setattr(cloud115.random, "uniform", interval)
+    monkeypatch.setattr(cloud115.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(cloud115.asyncio, "sleep", sleep)
+
+    async def pace() -> None:
+        client = Cloud115Client(
+            "UID=987654321_A1_x; CID=c; SEID=s",
+            batch_pacing=True,
+        )
+        try:
+            for _ in range(31):
+                await client._pace_webapi("https://webapi.115.com/files")
+        finally:
+            await client.close()
+
+    asyncio.run(pace())
+
+    assert intervals.count((10.0, 30.0)) == 1
+    assert sleep_delays[-1] == 17.0
+    assert cloud115._WEBAPI_NEXT_REQUEST_AT["987654321"] == now[0] + 1.0
+
+
+def test_http_405_on_any_domain_is_explicit_risk_control(monkeypatch) -> None:
+    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(405, text="blocked")
+
+    async def request() -> None:
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            with pytest.raises(Cloud115RiskControlError, match="HTTP 405"):
+                await client._request("GET", "https://other.example/files")
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(request())
+
+
+def test_http_403_remains_an_auth_error_even_with_a_waf_like_body(monkeypatch) -> None:
+    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="<html>request has been blocked</html>")
+
+    async def request() -> None:
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            with pytest.raises(Cloud115AuthError):
+                await client._request("GET", "https://webapi.115.com/files")
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(request())
+
+
+def test_http_400_on_webapi_is_risk_control(monkeypatch) -> None:
+    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400)
+
+    async def request() -> None:
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            with pytest.raises(Cloud115RiskControlError, match="HTTP 400"):
+                await client._request("GET", "https://webapi.115.com/files")
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(request())
 
 
 def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) -> None:

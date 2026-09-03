@@ -28,6 +28,7 @@ from .exceptions import (
     Cloud115NotFoundError,
     Cloud115OfflineTaskExistsError,
     Cloud115RequestError,
+    Cloud115RiskControlError,
     Cloud115VideoUnavailableError,
 )
 
@@ -39,6 +40,8 @@ _M3U8_ATTR = re.compile(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))')
 
 _WEBAPI_PACE_LOCK = threading.Lock()
 _WEBAPI_NEXT_REQUEST_AT: dict[str, float] = {}
+_WEBAPI_BATCH_SIZE = 30
+_WEBAPI_BATCH_DELAY_RANGE = (10.0, 30.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +125,7 @@ class Cloud115Client:
         timeout: float = 30.0,
         http_client: httpx.AsyncClient | None = None,
         pace_webapi: bool = True,
+        batch_pacing: bool = False,
     ) -> None:
         self._cookies = self._keep_essential(self.parse_cookies(cookies))
         uid = self._cookies.get("UID", "")
@@ -131,6 +135,8 @@ class Cloud115Client:
         self.user_id = match.group(1)
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
         self._pace_webapi_requests = pace_webapi
+        self._batch_pacing = batch_pacing
+        self._batch_webapi_request_count = 0
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
             timeout=timeout,
@@ -207,6 +213,12 @@ class Cloud115Client:
         self._merge_set_cookies(response)
         if response.status_code in {401, 403}:
             raise Cloud115AuthError("115 登录已失效")
+        if response.status_code == 405 or (
+            response.status_code == 400 and urlsplit(url).netloc == "webapi.115.com"
+        ):
+            raise Cloud115RiskControlError(
+                f"115 请求触发风控（HTTP {response.status_code}）"
+            )
         if not 200 <= response.status_code < 300:
             raise Cloud115RequestError(f"115 请求失败（HTTP {response.status_code}）")
         return response
@@ -217,10 +229,15 @@ class Cloud115Client:
             or urlsplit(url).netloc != "webapi.115.com"
         ):
             return
+        if self._batch_pacing and self._batch_webapi_request_count >= _WEBAPI_BATCH_SIZE:
+            self._batch_webapi_request_count = 0
+            await asyncio.sleep(random.uniform(*_WEBAPI_BATCH_DELAY_RANGE))
         with _WEBAPI_PACE_LOCK:
             now = time.monotonic()
             request_at = max(now, _WEBAPI_NEXT_REQUEST_AT.get(self.user_id, 0.0))
             _WEBAPI_NEXT_REQUEST_AT[self.user_id] = request_at + random.uniform(1.0, 3.0)
+            if self._batch_pacing:
+                self._batch_webapi_request_count += 1
         if request_at > now:
             await asyncio.sleep(request_at - now)
 
@@ -291,6 +308,8 @@ class Cloud115Client:
         self._merge_set_cookies(response)
         if response.status_code in {302, 401, 403}:
             return False
+        if response.status_code == 405:
+            raise Cloud115RiskControlError("115 请求触发风控（HTTP 405）")
         if not 200 <= response.status_code < 300:
             raise Cloud115RequestError(f"115 登录状态探测失败（HTTP {response.status_code}）")
         try:
@@ -499,6 +518,8 @@ class Cloud115Client:
             async with self._client.stream(
                 "GET", direct.url, headers={"User-Agent": direct.user_agent}
             ) as response:
+                if response.status_code == 405:
+                    raise Cloud115RiskControlError("115 请求触发风控（HTTP 405）")
                 if response.status_code not in {200, 206}:
                     raise Cloud115RequestError("115 文件读取失败")
                 async for chunk in response.aiter_bytes():

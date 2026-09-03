@@ -222,6 +222,31 @@ class Cloud115StorageProvider:
         except ValueError as exc:
             raise _error("scan_media_refs", "source_not_found", "115 扫描源无效") from exc
 
+    def scan_managed_media_ref_keys(self) -> set[str]:
+        """Enumerate the configured media root's stable pickcodes once."""
+        try:
+            async def scan() -> set[str]:
+                async with Cloud115Client(
+                    self._device_cookie,
+                    batch_pacing=True,
+                ) as client:
+                    return {
+                        entry.pickcode
+                        async for entry in client.iter_files_recursive(self._media_root_cid)
+                        if not entry.is_dir and entry.pickcode
+                    }
+
+            return run_sync(scan())
+        except Cloud115Error as exc:
+            raise _cloud_error("scan_managed_media_ref_keys", exc) from exc
+
+    @staticmethod
+    def managed_media_ref_key(*, media_ref: JsonObject) -> str:
+        return _media_entry(
+            media_ref,
+            operation="managed_media_ref_key",
+        ).pickcode
+
     async def _scan_dir(self, root_cid: str) -> list[ImportFile]:
         async with Cloud115Client(self._device_cookie) as client:
             source_entries = [entry async for entry in client.iter_files_recursive(root_cid)]

@@ -4,6 +4,15 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import pytest
+from src.plugins.provider_protocol import (
+    ImportFile,
+    ImportPlacement,
+    LibraryHandle,
+    MediaHandle,
+    ProviderOperationError,
+    ThumbnailArtifact,
+)
+
 from sakuramedia_115_provider import storage
 from sakuramedia_115_provider.cloud115 import (
     Cloud115Client,
@@ -14,14 +23,9 @@ from sakuramedia_115_provider.cloud115 import (
     Cloud115VideoInfo,
     Cloud115VideoSegment,
 )
-from sakuramedia_115_provider.exceptions import Cloud115VideoUnavailableError
-from src.plugins.provider_protocol import (
-    ImportFile,
-    ImportPlacement,
-    LibraryHandle,
-    MediaHandle,
-    ProviderOperationError,
-    ThumbnailArtifact,
+from sakuramedia_115_provider.exceptions import (
+    Cloud115RiskControlError,
+    Cloud115VideoUnavailableError,
 )
 
 
@@ -76,7 +80,7 @@ class ScanClient:
     list_calls: ClassVar[list[tuple[str, int, int]]] = []
     directory_info_calls: ClassVar[list[str]] = []
 
-    def __init__(self, _cookie: str) -> None:
+    def __init__(self, _cookie: str, **_kwargs: object) -> None:
         pass
 
     async def __aenter__(self):
@@ -257,6 +261,63 @@ def test_scan_media_refs_skips_relative_path_queries(monkeypatch, tmp_path) -> N
     assert ScanClient.recursive_calls == ["source"]
     assert ScanClient.list_calls == []
     assert ScanClient.directory_info_calls == []
+
+
+def test_scan_managed_media_ref_keys_enumerates_configured_media_root(
+    monkeypatch, tmp_path
+) -> None:
+    ScanClient.recursive_entries = (
+        Cloud115Entry("movie", "media", "movie.mp4", False, 99, "sha", "pc", 0, True),
+        Cloud115Entry("subtitle", "media", "movie.srt", False, 1, "sub-sha", "sub-pc", 0, False),
+    )
+    ScanClient.recursive_calls = []
+    ScanClient.list_calls = []
+    ScanClient.directory_info_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    keys = _scan_provider(tmp_path).scan_managed_media_ref_keys()
+
+    assert keys == {"pc", "sub-pc"}
+    assert ScanClient.recursive_calls == ["media"]
+    assert ScanClient.list_calls == []
+    assert ScanClient.directory_info_calls == []
+
+
+def test_managed_media_ref_key_uses_pickcode(tmp_path) -> None:
+    key = _scan_provider(tmp_path).managed_media_ref_key(
+        media_ref={
+            "version": 1,
+            "kind": "cloud115_media",
+            "fid": "old-fid",
+            "parent_cid": "old-parent",
+            "pickcode": "stable-pickcode",
+            "name": "old-name.mp4",
+            "size_bytes": 1,
+            "sha1": "old-sha",
+            "is_dir": False,
+        }
+    )
+
+    assert key == "stable-pickcode"
+
+
+class RiskScanClient(ScanClient):
+    async def iter_files_recursive(self, _cid: str):
+        raise Cloud115RiskControlError("115 请求触发风控")
+        yield  # pragma: no cover
+
+
+def test_scan_managed_media_ref_keys_maps_risk_control_to_retryable_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(storage, "Cloud115Client", RiskScanClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).scan_managed_media_ref_keys()
+
+    assert error.value.operation == "scan_managed_media_ref_keys"
+    assert error.value.code == "unavailable"
+    assert error.value.retryable is True
 
 
 def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch, tmp_path) -> None:

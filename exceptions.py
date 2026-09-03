@@ -23,6 +23,10 @@ class Cloud115RequestError(Cloud115Error):
     pass
 
 
+class Cloud115RiskControlError(Cloud115Error):
+    pass
+
+
 class Cloud115OfflineTaskExistsError(Cloud115Error):
     pass
 
