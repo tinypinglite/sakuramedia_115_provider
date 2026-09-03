@@ -248,7 +248,7 @@ def test_redirect_reuses_cached_direct_url(monkeypatch) -> None:
     assert FakeClient.download_user_agents == ["player-ua"]
 
 
-def test_direct_cache_uses_six_hour_ttl(monkeypatch) -> None:
+def test_direct_cache_uses_ten_minute_ttl(monkeypatch) -> None:
     cache = playback._PlaybackCache()
     monkeypatch.setattr(playback.time, "monotonic", lambda: 100.0)
     direct = Cloud115DirectUrl(
@@ -257,7 +257,7 @@ def test_direct_cache_uses_six_hour_ttl(monkeypatch) -> None:
 
     entry = cache.put_direct(("key",), direct)
 
-    assert entry.usable_until == 100.0 + 6 * 60 * 60
+    assert entry.usable_until == 100.0 + 10 * 60
 
 
 def test_hls_segment_refreshes_definition_once(monkeypatch) -> None:

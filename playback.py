@@ -39,7 +39,7 @@ from .exceptions import (
 )
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
-_DIRECT_URL_CACHE_TTL_SECONDS = 6 * 60 * 60
+_DIRECT_URL_CACHE_TTL_SECONDS = 10 * 60
 _MERGED_HLS_CACHE_TTL_SECONDS = 10 * 60
 _HLS_PATH = re.compile(r"^hls/([A-Za-z0-9_-]{16,})/segment/(\d+)\.ts$")
 _MERGED_HLS_PATH = re.compile(
