@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import ClassVar
 
 import httpx
 import pytest
@@ -21,9 +22,12 @@ from src.plugins.provider_protocol import LibraryHandle, MediaHandle, PlaybackCo
 
 class FakeClient:
     fail_hls = False
-    download_user_agents: list[str] = []
+    download_user_agents: ClassVar[list[str]] = []
+    video_info_pickcodes: ClassVar[list[str]] = []
 
-    def __init__(self, _cookie: str, *, user_agent: str | None = None) -> None:
+    def __init__(
+        self, _cookie: str, *, user_agent: str | None = None, **_kwargs
+    ) -> None:
         self.user_agent = user_agent
 
     async def __aenter__(self):
@@ -32,7 +36,8 @@ class FakeClient:
     async def __aexit__(self, *_exc) -> None:
         return None
 
-    async def get_video_info(self, _pickcode: str) -> Cloud115VideoInfo:
+    async def get_video_info(self, pickcode: str) -> Cloud115VideoInfo:
+        type(self).video_info_pickcodes.append(pickcode)
         if type(self).fail_hls:
             raise Cloud115RequestError("no hls")
         return Cloud115VideoInfo(
@@ -304,6 +309,7 @@ def test_merged_hls_playlist_concatenates_parts_with_discontinuity(monkeypatch) 
 
     playlist = root.body.decode()
     assert root.media_type == "application/vnd.apple.mpegurl"
+    assert "#EXT-X-PLAYLIST-TYPE:VOD" in playlist
     assert playlist.count("#EXTINF") == 4
     assert playlist.count("#EXT-X-DISCONTINUITY") == 1
     child_path = next(
@@ -321,3 +327,27 @@ def test_merged_hls_playlist_concatenates_parts_with_discontinuity(monkeypatch) 
 
     assert response.status_code == 200
     assert seen_calls == [("https://hls/0.ts", False)]
+
+
+def test_merged_hls_reuses_layout_for_repeated_playlists(monkeypatch) -> None:
+    FakeClient.fail_hls = False
+    FakeClient.video_info_pickcodes.clear()
+    monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
+    medias = (_media(20), _media(21))
+    context = _context(delivery="proxy", resource_path="index.m3u8")
+
+    first = asyncio.run(
+        playback.Cloud115Playback(device_cookie="merged-layout-cache-cookie").handle_merged(
+            medias=medias,
+            context=context,
+        )
+    )
+    second = asyncio.run(
+        playback.Cloud115Playback(device_cookie="merged-layout-cache-cookie").handle_merged(
+            medias=medias,
+            context=context,
+        )
+    )
+
+    assert first.body == second.body
+    assert FakeClient.video_info_pickcodes == ["pc", "pc"]

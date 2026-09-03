@@ -53,6 +53,37 @@ def test_webapi_pacing_is_shared_per_user_and_randomized(monkeypatch) -> None:
     assert sleep_delays == [2.0]
 
 
+def test_webapi_pacing_can_be_disabled(monkeypatch) -> None:
+    sleep_delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(cloud115.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(cloud115.asyncio, "sleep", sleep)
+    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {"987654321": 200.0})
+
+    def should_not_pace(_low: float, _high: float) -> float:
+        raise AssertionError("disabled WebAPI pacing must not reserve the shared queue")
+
+    monkeypatch.setattr(cloud115.random, "uniform", should_not_pace)
+
+    async def pace() -> None:
+        client = Cloud115Client(
+            "UID=987654321_A1_x; CID=c; SEID=s",
+            pace_webapi=False,
+        )
+        try:
+            await client._pace_webapi("https://webapi.115.com/files")
+            await client._pace_webapi("https://webapi.115.com/files")
+        finally:
+            await client.close()
+
+    asyncio.run(pace())
+
+    assert sleep_delays == []
+
+
 def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) -> None:
     monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
     monkeypatch.setattr(cloud115.random, "uniform", lambda _low, _high: 0.0)

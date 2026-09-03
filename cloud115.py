@@ -121,6 +121,7 @@ class Cloud115Client:
         user_agent: str | None = None,
         timeout: float = 30.0,
         http_client: httpx.AsyncClient | None = None,
+        pace_webapi: bool = True,
     ) -> None:
         self._cookies = self._keep_essential(self.parse_cookies(cookies))
         uid = self._cookies.get("UID", "")
@@ -129,6 +130,7 @@ class Cloud115Client:
             raise Cloud115AuthError("115 cookie 缺少有效 UID")
         self.user_id = match.group(1)
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        self._pace_webapi_requests = pace_webapi
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
             timeout=timeout,
@@ -210,7 +212,10 @@ class Cloud115Client:
         return response
 
     async def _pace_webapi(self, url: str) -> None:
-        if urlsplit(url).netloc != "webapi.115.com":
+        if (
+            not self._pace_webapi_requests
+            or urlsplit(url).netloc != "webapi.115.com"
+        ):
             return
         with _WEBAPI_PACE_LOCK:
             now = time.monotonic()

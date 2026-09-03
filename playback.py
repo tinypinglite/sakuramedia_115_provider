@@ -40,6 +40,7 @@ from .exceptions import (
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
 _DIRECT_URL_CACHE_TTL_SECONDS = 6 * 60 * 60
+_MERGED_HLS_CACHE_TTL_SECONDS = 10 * 60
 _HLS_PATH = re.compile(r"^hls/([A-Za-z0-9_-]{16,})/segment/(\d+)\.ts$")
 _MERGED_HLS_PATH = re.compile(
     r"^merged-hls/([A-Za-z0-9_-]{16,})/part/(\d+)/segment/(\d+)\.ts$"
@@ -183,12 +184,34 @@ class _PlaybackCache:
             credential_fingerprint=credential_fingerprint,
             pickcodes=pickcodes,
             segments_by_part=segments_by_part,
-            usable_until=time.monotonic() + 15 * 60,
+            usable_until=time.monotonic() + _MERGED_HLS_CACHE_TTL_SECONDS,
         )
         self._merged_hls[entry.token] = entry
         while len(self._merged_hls) > 64:
             self._merged_hls.popitem(last=False)
         return entry
+
+    def merged_hls_for_layout(
+        self,
+        *,
+        library_id: int,
+        media_ids: tuple[int, ...],
+        credential_fingerprint: str,
+        pickcodes: tuple[str, ...],
+    ) -> _MergedHlsEntry | None:
+        now = time.monotonic()
+        for token, entry in reversed(tuple(self._merged_hls.items())):
+            if entry.usable_until <= now:
+                continue
+            if (
+                entry.library_id == library_id
+                and entry.media_ids == media_ids
+                and entry.credential_fingerprint == credential_fingerprint
+                and entry.pickcodes == pickcodes
+            ):
+                self._merged_hls.move_to_end(token)
+                return entry
+        return None
 
     def merged_hls_for(
         self,
@@ -220,7 +243,7 @@ class _PlaybackCache:
         updated_parts = list(entry.segments_by_part)
         updated_parts[part_index] = segments
         entry.segments_by_part = tuple(updated_parts)
-        entry.usable_until = time.monotonic() + 15 * 60
+        entry.usable_until = time.monotonic() + _MERGED_HLS_CACHE_TTL_SECONDS
 
 
 _CACHE = _PlaybackCache()
@@ -347,8 +370,21 @@ class Cloud115Playback:
         medias: tuple[MediaHandle, ...],
         pickcodes: tuple[str, ...],
     ) -> _MergedHlsEntry:
+        library_id = medias[0].library.library_id
+        media_ids = tuple(media.media_id for media in medias)
+        cached = _CACHE.merged_hls_for_layout(
+            library_id=library_id,
+            media_ids=media_ids,
+            credential_fingerprint=self._credential_fingerprint,
+            pickcodes=pickcodes,
+        )
+        if cached is not None:
+            return cached
+
         segments_by_part: list[tuple[Cloud115VideoSegment, ...]] = []
-        async with Cloud115Client(self._device_cookie) as client:
+        async with Cloud115Client(
+            self._device_cookie, pace_webapi=False
+        ) as client:
             for pickcode in pickcodes:
                 info = await client.get_video_info(pickcode)
                 segments = await client.get_video_segments(
@@ -358,8 +394,8 @@ class Cloud115Playback:
                     raise Cloud115RequestError("115 HLS 分片为空")
                 segments_by_part.append(segments)
         return _CACHE.put_merged_hls(
-            library_id=medias[0].library.library_id,
-            media_ids=tuple(media.media_id for media in medias),
+            library_id=library_id,
+            media_ids=media_ids,
             credential_fingerprint=self._credential_fingerprint,
             pickcodes=pickcodes,
             segments_by_part=tuple(segments_by_part),
@@ -632,6 +668,7 @@ class Cloud115Playback:
         lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:3",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
             f"#EXT-X-TARGETDURATION:{target_duration}",
             "#EXT-X-MEDIA-SEQUENCE:0",
         ]
