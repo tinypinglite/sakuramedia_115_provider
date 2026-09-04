@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path, PurePosixPath
+
+from loguru import logger
 
 from src.plugins import (
     PluginContext,
@@ -30,7 +33,12 @@ from .cloud115 import (
     exchange_web_cookie_for_alipaymini,
     run_sync,
 )
-from .exceptions import Cloud115AuthError, Cloud115Error, Cloud115NotFoundError
+from .exceptions import (
+    Cloud115AuthError,
+    Cloud115Error,
+    Cloud115NotFoundError,
+    safe_error_message,
+)
 from .offline import Cloud115OfflineDownloadComponent
 
 PLUGIN_ID = "sakuramedia_115_provider"
@@ -137,8 +145,12 @@ class Cloud115MediaProviderBundle:
                 )
             )
         except Cloud115NotFoundError as exc:
+            logger.warning("115 媒体库配置准备失败 media_root={} downloads_root={} error_type={} reason={}",
+                           media_root_path, downloads_root_path, type(exc).__name__, safe_error_message(exc))
             raise _error("prepare_library", "invalid_config", "115 配置的目录不存在") from exc
         except Cloud115Error as exc:
+            logger.warning("115 媒体库配置准备失败 media_root={} downloads_root={} error_type={} reason={}",
+                           media_root_path, downloads_root_path, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("prepare_library", exc) from exc
 
     async def _prepare(
@@ -148,6 +160,8 @@ class Cloud115MediaProviderBundle:
         downloads_root_path: str,
         previous: LibraryHandle | None,
     ) -> PreparedLibrary:
+        started = time.monotonic()
+        logger.info("115 媒体库配置准备开始 media_root={} downloads_root={}", media_root_path, downloads_root_path)
         previous_config = previous.provider_config if previous is not None else {}
         device_cookie = previous_config.get("device_cookie") if isinstance(previous_config, dict) else None
         reusable = (
@@ -156,18 +170,25 @@ class Cloud115MediaProviderBundle:
             and previous_config.get("web_cookie") == web_cookie
         )
         if reusable:
+            logger.info("115 设备登录复用验证开始")
             async with Cloud115Client(device_cookie) as client:
                 if not await client.check_alive():
                     reusable = False
+                    logger.info("115 已有设备登录失效，准备重新换取")
         if not reusable:
+            logger.info("115 设备登录换取开始")
             device_cookie = await exchange_web_cookie_for_alipaymini(web_cookie)
         assert isinstance(device_cookie, str)
         async with Cloud115Client(device_cookie) as client:
             if not await client.check_alive():
                 raise Cloud115AuthError("115 专用设备 Cookie 已失效")
             account_uid = client.user_id
+            logger.info("115 设备登录验证成功 account_uid={} reused={}", account_uid, reusable)
             media_root = await _resolve_directory_path(client, media_root_path)
+            logger.info("115 媒体目录解析完成 cid={}", media_root)
             downloads_root = await _resolve_directory_path(client, downloads_root_path)
+            logger.info("115 下载目录解析完成 cid={}", downloads_root)
+        logger.info("115 媒体库配置准备完成 account_uid={} elapsed_seconds={:.2f}", account_uid, time.monotonic() - started)
         return PreparedLibrary(
             provider_config={
                 "web_cookie": web_cookie,

@@ -953,12 +953,12 @@ def test_finalize_transfer_requires_directory_visibility(monkeypatch, tmp_path):
         _scan_provider(tmp_path).finalize_transfer(receipt=_valid_transfer_receipt())
 
 
-def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path):
+def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path, log_messages):
     from sakuramedia_115_provider.exceptions import Cloud115RequestError
 
     class UnknownClient(TransferClient):
         async def rapid_upload(self, *_args, **_kwargs):
-            raise Cloud115RequestError("timeout")
+            raise Cloud115RequestError("timeout https://upstream.example/file?sign=private-signature UID=private-cookie; SEID=private-session")
 
         async def list_directory(self, cid):
             assert cid != "op-cid", "must not search an unknown upload"
@@ -973,6 +973,10 @@ def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path)
             operation_key="task:unknown",
         )
     assert UnknownClient.delete_calls == []
+    assert any("保留操作目录" in message and "operation_cid=op-cid" in message for message in log_messages)
+    assert any("operation_key=task:unknown" in message and "timeout" in message for message in log_messages)
+    assert not any("已删除" in message or "秒传命中" in message for message in log_messages)
+    assert not any(secret in "\n".join(log_messages) for secret in ("private-signature", "private-cookie", "private-session"))
 
 
 def test_transfer_batch_reuses_parent_inventory(monkeypatch, tmp_path):
@@ -1060,3 +1064,67 @@ def test_abort_cannot_delete_an_operation_using_an_invalid_empty_listing(
     with pytest.raises(ProviderOperationError):
         _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
     assert all(request.method == "GET" for request in requests)
+
+
+@pytest.mark.parametrize(
+    "next_batch,next_library,next_account,next_root,expected_reads",
+    [
+        ("7", 1, "123", "media", 1),
+        ("8", 1, "123", "media", 2),
+        ("7", 2, "123", "media", 2),
+        ("7", 1, "456", "media", 2),
+        ("7", 1, "123", "other", 2),
+    ],
+)
+def test_download_import_directory_cache_scope(
+    monkeypatch, tmp_path, next_batch, next_library, next_account, next_root, expected_reads
+):
+    reads = []
+    created = []
+
+    class DirectoryClient(FakeClient):
+        entries = {}
+
+        async def list_directory(self, cid):
+            reads.append(cid)
+            return await super().list_directory(cid)
+
+        async def mkdir(self, parent_cid, name):
+            cid = f"{parent_cid}/{name}"
+            created.append(cid)
+            self.entries.setdefault(parent_cid, []).append(
+                Cloud115Entry(cid, parent_cid, name, True, 0, "", "", 0, False)
+            )
+            self.entries[cid] = []
+            return cid
+
+    monkeypatch.setattr(storage, "Cloud115Client", DirectoryClient)
+    monkeypatch.setattr(storage, "_IMPORT_DIRECTORIES", {})
+    source = ImportFile(
+        source_ref={
+            "version": 1, "kind": "cloud115_entry", "fid": "source-fid",
+            "parent_cid": "source-parent", "pickcode": "source-pc",
+            "name": "movie.mp4", "size_bytes": 99, "sha1": "sha", "is_dir": False,
+        },
+        name="movie.mp4", relative_path="movie.mp4", size_bytes=99, is_video=True,
+    )
+    for index, (batch, library_id, account, root) in enumerate([
+        ("7", 1, "123", "media"),
+        (next_batch, next_library, next_account, next_root),
+    ]):
+        provider = storage.Cloud115StorageProvider(
+            library=LibraryHandle(
+                library_id, "cloud115",
+                {"device_cookie": "cookie", "media_root_cid": root}, account,
+            ),
+            data_dir=tmp_path,
+        )
+        result = provider.stage_import_file(
+            source=source, placement=ImportPlacement(relative_path="jav/ABC-001/movie.mp4"),
+            source_disposition="keep", operation_key=f"task:{batch}:download:{index + 1}:1",
+        )
+        assert result.storage_ref["pickcode"] == "target-pc"
+    assert sum(reads.count(root) for root in {"media", next_root}) == expected_reads
+    assert sum(reads.count(f"{root}/jav") for root in {"media", next_root}) == expected_reads
+    assert created.count("media/jav") == 1
+    assert created.count("media/jav/ABC-001") == 1

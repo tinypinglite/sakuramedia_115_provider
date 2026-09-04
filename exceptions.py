@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 class Cloud115Error(RuntimeError):
     pass
@@ -37,3 +39,14 @@ class Cloud115VideoUnavailableError(Cloud115Error):
 
 class Cloud115CipherError(Cloud115Error):
     pass
+
+
+def safe_error_message(exc: BaseException) -> str:
+    """Keep upstream diagnostics without logging URLs or 115 Cookie values."""
+    message = re.sub(r"(?i)\b(?:https?://|magnet:)[^\s<>]+", "[URL]", str(exc))
+    message = re.sub(
+        r"(?i)\b(UID|CID|SEID|KID)\s*=\s*[^;\s,]+",
+        r"\1=[REDACTED]",
+        message,
+    )
+    return " ".join(message.split())[:512]

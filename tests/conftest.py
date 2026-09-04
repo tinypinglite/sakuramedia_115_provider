@@ -4,6 +4,9 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+from loguru import logger
+
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PLUGINS_ROOT = PLUGIN_ROOT.parent
 host_root = os.environ.get("SAKURAMEDIA_HOST_ROOT")
@@ -15,3 +18,13 @@ if not (HOST_ROOT / "src/plugins/provider_protocol.py").is_file():
 for path in (PLUGINS_ROOT, HOST_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+
+@pytest.fixture
+def log_messages():
+    messages = []
+    sink = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink)

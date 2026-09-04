@@ -175,7 +175,7 @@ def test_rapid_upload_rejects_non_f1_r2_cookie_without_a_request() -> None:
     asyncio.run(run())
 
 
-def test_safe_get_retries_two_transient_server_failures(monkeypatch) -> None:
+def test_safe_get_retries_two_transient_server_failures(monkeypatch, log_messages) -> None:
     attempts = 0
     backoffs: list[float] = []
 
@@ -199,13 +199,17 @@ def test_safe_get_retries_two_transient_server_failures(monkeypatch) -> None:
                 http_client=http_client,
                 pace_webapi=False,
             )
-            await client._json("GET", "https://proapi.115.com/retry-test")
+            await client._json("GET", "https://proapi.115.com/retry-test?sign=private-signature")
         finally:
             await http_client.aclose()
 
     asyncio.run(run())
     assert attempts == 3
     assert backoffs == [0.5, 1.0]
+    assert len(log_messages) == 2
+    assert all("status=503" in message and "retry=True" in message for message in log_messages)
+    assert "attempt=1" in log_messages[0] and "attempt=2" in log_messages[1]
+    assert all("private-signature" not in message and "123456_R2_token" not in message for message in log_messages)
 
 
 def test_initupload_post_is_never_retried() -> None:

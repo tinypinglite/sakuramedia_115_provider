@@ -20,6 +20,7 @@ from typing import Any, ClassVar, Literal, Protocol
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import httpx
+from loguru import logger
 from typing_extensions import Self
 
 from .cipher import (
@@ -256,6 +257,8 @@ class Cloud115Client:
             else retryable
         )
         max_retries = self._MAX_RETRIES if should_retry else 0
+        endpoint = urlsplit(url)
+        request_endpoint = f"{endpoint.hostname}{endpoint.path}"
         for attempt in range(max_retries + 1):
             await self._pace_webapi(url)
             try:
@@ -273,13 +276,23 @@ class Cloud115Client:
                 httpx.NetworkError,
                 httpx.RemoteProtocolError,
             ) as exc:
+                logger.warning("115 请求网络异常 method={} endpoint={} attempt={} retry={} wait_seconds={} error_type={}",
+                               method, request_endpoint, attempt + 1, attempt < max_retries,
+                               self._RETRY_BACKOFF_STEP * (attempt + 1) if attempt < max_retries else 0,
+                               type(exc).__name__)
                 if attempt >= max_retries:
                     raise Cloud115RequestError("115 网络请求失败") from exc
                 await asyncio.sleep(self._RETRY_BACKOFF_STEP * (attempt + 1))
                 continue
             except httpx.RequestError as exc:
+                logger.warning("115 请求失败 method={} endpoint={} error_type={}", method, request_endpoint, type(exc).__name__)
                 raise Cloud115RequestError("115 网络请求失败") from exc
             self._merge_set_cookies(response)
+            if not 200 <= response.status_code < 300:
+                will_retry = 500 <= response.status_code < 600 and attempt < max_retries
+                logger.warning("115 请求返回异常 method={} endpoint={} status={} attempt={} retry={} wait_seconds={}",
+                               method, request_endpoint, response.status_code, attempt + 1, will_retry,
+                               self._RETRY_BACKOFF_STEP * (attempt + 1) if will_retry else 0)
             if response.status_code in {401, 403}:
                 raise Cloud115AuthError("115 登录已失效")
             if (
@@ -326,6 +339,8 @@ class Cloud115Client:
                 1.0, 3.0
             )
         if request_at > now:
+            logger.debug("115 请求节流等待 account_uid={} wait_seconds={:.2f} batch={}",
+                         self.user_id, request_at - now, self._batch_pacing)
             await asyncio.sleep(request_at - now)
 
     async def _json(
@@ -485,6 +500,7 @@ class Cloud115Client:
             raise ValueError("115 directory ID is required")
         offset = 0
         total = -1
+        last_progress = time.monotonic()
         while total < 0 or offset < total:
             payload = await self._json(
                 "GET",
@@ -507,6 +523,10 @@ class Cloud115Client:
                 if not entry.is_dir:
                     yield entry
             offset += len(entries)
+            now = time.monotonic()
+            if now - last_progress >= 10:
+                logger.info("115 文件枚举进度 account_uid={} cid={} entries={} total={}", self.user_id, cid, offset, total)
+                last_progress = now
 
     async def directory_info(self, cid: str) -> Cloud115DirectoryInfo:
         if not cid:
@@ -594,6 +614,7 @@ class Cloud115Client:
         data = self._upload_data(response)
         status = _as_int(data.get("status"))
         if status == 7:
+            logger.info("115 秒传需要源文件分段校验 operation_cid={}", parent_cid)
             sign_key = _as_text(data.get("sign_key"))
             sign_check = _as_text(data.get("sign_check"))
             if not sign_key or not sign_check:

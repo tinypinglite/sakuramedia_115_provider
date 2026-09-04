@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ from .exceptions import (
     Cloud115NotFoundError,
     Cloud115RequestError,
     Cloud115VideoUnavailableError,
+    safe_error_message,
 )
 from .hls_reader import Cloud115HlsSegmentReader
 from .playback import Cloud115Playback
@@ -75,6 +77,10 @@ _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
 _HASH_MIDDLE_BYTES = 1024 * 1024
 _HASH_FULL_THRESHOLD = 8 * 1024 * 1024
 _HASH_REQUEST_DELAY_RANGE = (2.0, 4.0)
+# 每个媒体库只保留最近一次下载导入批次的目录清单。
+_IMPORT_DIRECTORIES: dict[
+    tuple[str | None, int, str], tuple[str, dict[str, dict[str, str]]]
+] = {}
 _VIDEO_SUFFIXES = frozenset(
     {
         ".3gp",
@@ -164,6 +170,8 @@ class Cloud115StorageProvider:
         try:
             entries, total = run_sync(list_page())
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} cid={} error_type={} reason={}",
+                           self.library.library_id, "browse", cid, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("browse", exc) from exc
         result = tuple(self._browse_entry(entry) for entry in entries)
         next_cursor = str(offset + len(entries)) if offset + len(entries) < total else None
@@ -182,8 +190,15 @@ class Cloud115StorageProvider:
                     raise ValueError("directory entry must use directory ref")
                 return (self._import_file(entry, relative_path=entry.name),)
             cid = _directory_ref(source_ref, operation="scan_import_source")
-            return tuple(run_sync(self._scan_dir(cid)))
+            started = time.monotonic()
+            logger.info("115 导入源扫描开始 library_id={} cid={}", self.library.library_id, cid)
+            files = tuple(run_sync(self._scan_dir(cid)))
+            logger.info("115 导入源扫描完成 library_id={} cid={} files={} elapsed_seconds={:.2f}",
+                        self.library.library_id, cid, len(files), time.monotonic() - started)
+            return files
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} cid={} error_type={} reason={}",
+                           self.library.library_id, "scan_import_source", cid, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("scan_import_source", exc) from exc
         except ValueError as exc:
             raise _error("scan_import_source", "source_not_found", "115 导入源无效") from exc
@@ -224,8 +239,15 @@ class Cloud115StorageProvider:
                     ]
                     return tuple(refs)
 
-            return run_sync(scan())
+            started = time.monotonic()
+            logger.info("115 媒体引用扫描开始 library_id={} cid={}", self.library.library_id, cid)
+            refs = run_sync(scan())
+            logger.info("115 媒体引用扫描完成 library_id={} cid={} files={} elapsed_seconds={:.2f}",
+                        self.library.library_id, cid, len(refs), time.monotonic() - started)
+            return refs
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} cid={} error_type={} reason={}",
+                           self.library.library_id, "scan_media_refs", cid, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("scan_media_refs", exc) from exc
         except ValueError as exc:
             raise _error("scan_media_refs", "source_not_found", "115 扫描源无效") from exc
@@ -244,8 +266,15 @@ class Cloud115StorageProvider:
                         if not entry.is_dir and entry.pickcode
                     }
 
-            return run_sync(scan())
+            started = time.monotonic()
+            logger.info("115 媒体库盘点开始 library_id={} cid={}", self.library.library_id, self._media_root_cid)
+            keys = run_sync(scan())
+            logger.info("115 媒体库盘点完成 library_id={} cid={} files={} elapsed_seconds={:.2f}",
+                        self.library.library_id, self._media_root_cid, len(keys), time.monotonic() - started)
+            return keys
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} cid={} error_type={} reason={}",
+                           self.library.library_id, "scan_managed_media_ref_keys", self._media_root_cid, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("scan_managed_media_ref_keys", exc) from exc
 
     @staticmethod
@@ -258,6 +287,8 @@ class Cloud115StorageProvider:
     async def _scan_dir(self, root_cid: str) -> list[ImportFile]:
         async with Cloud115Client(self._device_cookie) as client:
             source_entries = [entry async for entry in client.iter_files_recursive(root_cid)]
+            logger.info("115 导入源文件枚举完成，开始解析相对路径 library_id={} cid={} files={}",
+                        self.library.library_id, root_cid, len(source_entries))
             relative_dirs: dict[str, tuple[str, ...]] = {root_cid: ()}
             pending_parent_ids = {
                 entry.parent_id
@@ -312,6 +343,8 @@ class Cloud115StorageProvider:
         try:
             content = run_sync(read())
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} fid={} error_type={} reason={}",
+                           self.library.library_id, "read_import_file", entry.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("read_import_file", exc) from exc
         return ImportFileContent(
             content=content,
@@ -330,11 +363,16 @@ class Cloud115StorageProvider:
             async with Cloud115Client(self._device_cookie) as client:
                 await client.delete_files([entry.entry_id], parent_cid=entry.parent_id)
 
+        logger.info("115 删除文件开始 library_id={} operation={} fid={}", self.library.library_id, "delete_import_file", entry.entry_id)
         try:
             run_sync(delete())
+            logger.info("115 文件操作完成 library_id={} operation={} fid={}", self.library.library_id, "delete_import_file", entry.entry_id)
         except Cloud115NotFoundError:
+            logger.info("115 文件已不存在 library_id={} operation={} fid={}", self.library.library_id, "delete_import_file", entry.entry_id)
             return
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} fid={} error_type={} reason={}",
+                           self.library.library_id, "delete_import_file", entry.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("delete_import_file", exc) from exc
 
     def stage_import_file(
@@ -355,6 +393,16 @@ class Cloud115StorageProvider:
             operation_dir = _operation_directory(operation_key)
         except ValueError as exc:
             raise _error("stage_import", "invalid_config", "115 导入参数无效") from exc
+        directory_cache = None
+        batch = re.fullmatch(r"task:(\d+):download:\d+:\d+", operation_key)
+        if batch is not None:
+            key = (self.library.account_key, self.library.library_id, self._media_root_cid)
+            batch_id = batch.group(1)
+            cached = _IMPORT_DIRECTORIES.get(key)
+            if cached is None or cached[0] != batch_id:
+                cached = (batch_id, {})
+                _IMPORT_DIRECTORIES[key] = cached
+            directory_cache = cached[1]
         try:
             return run_sync(
                 self._stage(
@@ -362,10 +410,17 @@ class Cloud115StorageProvider:
                     placement_parts=placement_parts,
                     operation_dir=operation_dir,
                     source_disposition=source_disposition,
+                    directory_cache=directory_cache,
                 )
             )
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} operation_key={} source_fid={} error_type={} reason={}",
+                           self.library.library_id, "stage_import", operation_key, source_entry.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("stage_import", exc) from exc
+        except Exception as exc:
+            logger.error("115 暂存操作异常 library_id={} operation_key={} target={} error_type={} reason={}",
+                         self.library.library_id, operation_key, placement.relative_path, type(exc).__name__, safe_error_message(exc))
+            raise
 
     async def _stage(
         self,
@@ -374,18 +429,26 @@ class Cloud115StorageProvider:
         placement_parts: tuple[str, ...],
         operation_dir: str,
         source_disposition: str,
+        directory_cache: dict[str, dict[str, str]] | None,
     ) -> StagedMedia:
+        started = time.monotonic()
+        logger.info("115 网盘导入开始 library_id={} operation_dir={} source_fid={} target={} disposition={}",
+                    self.library.library_id, operation_dir, source_entry.entry_id,
+                    "/".join(placement_parts), source_disposition)
         async with Cloud115Client(self._device_cookie) as client:
+            logger.info("115 导入媒体探测开始 operation_dir={} source_fid={}", operation_dir, source_entry.entry_id)
             duration_seconds, resolution = await self._probe_duration_and_resolution_with_client(
                 client, source_entry
             )
+            logger.info("115 导入媒体探测完成 operation_dir={} duration_seconds={} resolution={}",
+                        operation_dir, duration_seconds, resolution)
             target_parent = self._media_root_cid
             for component in placement_parts[:-1]:
-                target_parent = await find_or_create_subdir(
-                    client, parent_cid=target_parent, name=component
+                target_parent = await self._directory(
+                    client, target_parent, component, directory_cache
                 )
-            target_dir = await find_or_create_subdir(
-                client, parent_cid=target_parent, name=operation_dir
+            target_dir = await self._directory(
+                client, target_parent, operation_dir, directory_cache
             )
             existing = tuple(
                 entry
@@ -394,7 +457,12 @@ class Cloud115StorageProvider:
             )
             if existing:
                 target_entry = existing[0]
+                logger.info("115 导入复用已有文件 operation_dir={} target_cid={} target_fid={}",
+                            operation_dir, target_dir, target_entry.entry_id)
             else:
+                logger.info("115 导入文件操作 operation_dir={} source_fid={} target_cid={} action={}",
+                            operation_dir, source_entry.entry_id, target_dir,
+                            "copy" if source_disposition == "keep" else "move")
                 if source_disposition == "keep":
                     await client.copy_files([source_entry.entry_id], parent_cid=target_dir)
                 else:
@@ -402,6 +470,9 @@ class Cloud115StorageProvider:
                 target_entry = _find_staged_entry(
                     await client.list_directory(target_dir), source_entry
                 )
+        logger.info("115 网盘导入暂存完成 library_id={} operation_dir={} target_fid={} target_cid={} elapsed_seconds={:.2f}",
+                    self.library.library_id, operation_dir, target_entry.entry_id,
+                    target_entry.parent_id, time.monotonic() - started)
         storage_ref = _media_ref(target_entry)
         return _staged_media(
             storage_ref=storage_ref,
@@ -426,6 +497,8 @@ class Cloud115StorageProvider:
         try:
             return run_sync(self._probe_duration(entry))
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} media_id={} error_type={} reason={}",
+                           self.library.library_id, "probe_duration_seconds", media.media_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("probe_duration_seconds", exc) from exc
 
     def probe_resolution(self, *, media: MediaHandle) -> str | None:
@@ -433,6 +506,8 @@ class Cloud115StorageProvider:
         try:
             return run_sync(self._probe_resolution(entry))
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} media_id={} error_type={} reason={}",
+                           self.library.library_id, "probe_resolution", media.media_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("probe_resolution", exc) from exc
 
     async def _probe_duration(self, entry: Cloud115Entry) -> int:
@@ -510,25 +585,36 @@ class Cloud115StorageProvider:
                 )
             )
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} operation_key={} target={} error_type={} reason={}",
+                           self.library.library_id, "stage_transfer", operation_key, placement.relative_path, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("stage_transfer", exc) from None
 
-    async def _transfer_directory(
-        self, client: Cloud115Client, parent: str, name: str
+        except Exception as exc:
+            logger.error("115 暂存操作异常 library_id={} operation_key={} target={} error_type={} reason={}",
+                         self.library.library_id, operation_key, placement.relative_path, type(exc).__name__, safe_error_message(exc))
+            raise
+
+    @staticmethod
+    async def _directory(
+        client: Cloud115Client, parent: str, name: str,
+        cache: dict[str, dict[str, str]] | None,
     ) -> str:
+        if cache is None:
+            return await find_or_create_subdir(client, parent_cid=parent, name=name)
         for attempt in range(2):
-            if parent not in self._transfer_directories:
+            if parent not in cache:
                 entries = await client.list_directory(parent)
-                self._transfer_directories[parent] = {
+                cache[parent] = {
                     entry.name: entry.entry_id for entry in entries if entry.is_dir
                 }
-            directories = self._transfer_directories[parent]
+            directories = cache[parent]
             if name in directories:
                 return directories[name]
             try:
                 directories[name] = await client.mkdir(parent, name)
                 return directories[name]
             except Cloud115DuplicateNameError:
-                self._transfer_directories.pop(parent, None)
+                cache.pop(parent, None)
                 if attempt:
                     raise
         raise AssertionError("unreachable directory lookup")
@@ -542,6 +628,9 @@ class Cloud115StorageProvider:
         placement_parts: tuple[str, ...],
         operation_dir: str,
     ) -> StagedMediaTransfer:
+        started = time.monotonic()
+        logger.info("115 秒传开始 library_id={} operation_dir={} file={} size_bytes={} target={}",
+                    self.library.library_id, operation_dir, source_name, source_size, "/".join(placement_parts))
         async with Cloud115Client(
             self._device_cookie,
             batch_pacing=True,
@@ -550,14 +639,20 @@ class Cloud115StorageProvider:
             # 不支持的 Cookie 在哈希和远端建目录之前拒绝。
             client._rapid_upload_protocol()
             # Hash before mkdir/init; only this successful mkdir owns the operation directory.
+            hash_started = time.monotonic()
+            logger.info("115 秒传源文件哈希开始 operation_dir={} size_bytes={}", operation_dir, source_size)
             source_sha1 = await asyncio.to_thread(
                 client._hash_source, source, source_size
             )
             source.assert_unchanged()
+            logger.info("115 秒传源文件哈希完成 operation_dir={} elapsed_seconds={:.2f}",
+                        operation_dir, time.monotonic() - hash_started)
             parent = self._media_root_cid
             for component in placement_parts[:-1]:
-                parent = await self._transfer_directory(client, parent, component)
+                parent = await self._directory(client, parent, component, self._transfer_directories)
             operation_cid = await client.mkdir(parent, operation_dir)
+            logger.info("115 秒传操作目录已创建，开始提交 operation_dir={} operation_cid={}",
+                        operation_dir, operation_cid)
             target_entry = None
             not_hit = False
             try:
@@ -593,17 +688,25 @@ class Cloud115StorageProvider:
                         target_entry=target_entry,
                         allow_empty_directory=not_hit,
                     )
-                except Exception:
-                    logger.warning("115 秒传补偿未完成，可能有残留副本")
+                except Exception as rollback_error:
+                    logger.warning("115 秒传补偿未完成 operation_dir={} operation_cid={} target_fid={} error_type={} reason={}",
+                                   operation_dir, operation_cid, target_entry.entry_id if target_entry else None,
+                                   type(rollback_error).__name__,
+                                   safe_error_message(rollback_error))
                 raise
             if not_hit:
+                logger.info("115 秒传未命中，开始清理空操作目录 operation_dir={} operation_cid={}", operation_dir, operation_cid)
                 await self._rollback_transfer_operation(
                     client,
                     operation_cid=operation_cid,
                     target_entry=None,
                     allow_empty_directory=True,
                 )
+                logger.info("115 秒传未命中处理完成 operation_dir={} elapsed_seconds={:.2f}",
+                            operation_dir, time.monotonic() - started)
                 return StagedMediaTransfer(status="not_available")
+        logger.info("115 秒传命中，暂存结果已校验 library_id={} operation_dir={} operation_cid={} target_fid={} elapsed_seconds={:.2f}",
+                    self.library.library_id, operation_dir, operation_cid, target_entry.entry_id, time.monotonic() - started)
         return StagedMediaTransfer(
             status="staged",
             storage_ref=_media_ref(target_entry),
@@ -630,6 +733,8 @@ class Cloud115StorageProvider:
         target_entry: Cloud115Entry | None,
         allow_empty_directory: bool,
     ) -> None:
+        logger.info("115 秒传回滚开始 operation_cid={} target_fid={}",
+                    operation_cid, target_entry.entry_id if target_entry else None)
         if target_entry is not None:
             if target_entry.parent_id != operation_cid:
                 raise Cloud115RequestError("115 秒传暂存文件已离开操作目录，拒绝删除")
@@ -645,19 +750,26 @@ class Cloud115StorageProvider:
                 await client.delete_files(
                     [current.entry_id], parent_cid=current.parent_id
                 )
+                logger.info("115 秒传回滚已删除暂存文件 operation_cid={} target_fid={}", operation_cid, current.entry_id)
+            else:
+                logger.info("115 秒传回滚暂存文件已不存在 operation_cid={} target_fid={}", operation_cid, target_entry.entry_id)
         elif not allow_empty_directory:
+            logger.warning("115 秒传结果不明，保留操作目录且不搜索或删除 operation_cid={}", operation_cid)
             return
 
         try:
             remaining = await client.list_directory(operation_cid)
         except Cloud115NotFoundError:
+            logger.info("115 秒传回滚操作目录已不存在 operation_cid={}", operation_cid)
             return
         if remaining:
             raise Cloud115RequestError("115 秒传操作目录非空，拒绝删除目录")
         try:
             await client.delete_files([operation_cid])
         except Cloud115NotFoundError:
-            pass
+            logger.info("115 秒传回滚操作目录已不存在 operation_cid={}", operation_cid)
+        else:
+            logger.info("115 秒传回滚已删除空操作目录 operation_cid={}", operation_cid)
 
     @staticmethod
     def _same_transfer_entry(left: Cloud115Entry, right: Cloud115Entry) -> bool:
@@ -706,9 +818,15 @@ class Cloud115StorageProvider:
                         return
                 raise Cloud115RequestError("115 目标尚未在目录中确认")
 
+        logger.info("115 秒传目标确认开始 library_id={} operation_cid={} target_fid={}",
+                    self.library.library_id, expected.parent_id, expected.entry_id)
         try:
             run_sync(verify())
+            logger.info("115 秒传目标确认成功 library_id={} operation_cid={} target_fid={}",
+                        self.library.library_id, expected.parent_id, expected.entry_id)
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} operation_cid={} target_fid={} error_type={} reason={}",
+                           self.library.library_id, "finalize_transfer", expected.parent_id, expected.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("finalize_transfer", exc) from None
 
     def abort_transfer(self, *, receipt: JsonObject) -> None:
@@ -730,6 +848,8 @@ class Cloud115StorageProvider:
         try:
             run_sync(abort())
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} operation_cid={} target_fid={} error_type={} reason={}",
+                           self.library.library_id, "abort_transfer", expected.parent_id, expected.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("abort_transfer", exc) from None
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
@@ -738,6 +858,9 @@ class Cloud115StorageProvider:
     def abort_import(self, *, receipt: JsonObject) -> None:
         stage = _stage_receipt(receipt, operation="abort_import")
 
+        logger.info("115 导入撤销开始 library_id={} target_fid={} target_cid={} source_cid={} action={}",
+                    self.library.library_id, stage["target_fid"], stage["target_parent_cid"], stage["source_parent_cid"],
+                    "delete_copy" if stage["source_disposition"] == "keep" else "move_back")
         async def abort() -> None:
             async with Cloud115Client(self._device_cookie) as client:
                 if stage["source_disposition"] == "keep":
@@ -751,9 +874,13 @@ class Cloud115StorageProvider:
 
         try:
             run_sync(abort())
+            logger.info("115 文件操作完成 library_id={} operation={} fid={}", self.library.library_id, "abort_import", stage["target_fid"])
         except Cloud115NotFoundError:
+            logger.info("115 文件已不存在 library_id={} operation={} fid={}", self.library.library_id, "abort_import", stage["target_fid"])
             return
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} target_fid={} error_type={} reason={}",
+                           self.library.library_id, "abort_import", stage["target_fid"], type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("abort_import", exc) from exc
 
     def delete_media(self, *, media: MediaHandle) -> None:
@@ -763,11 +890,16 @@ class Cloud115StorageProvider:
             async with Cloud115Client(self._device_cookie) as client:
                 await client.delete_files([entry.entry_id], parent_cid=entry.parent_id)
 
+        logger.info("115 删除文件开始 library_id={} operation={} fid={}", self.library.library_id, "delete_media", entry.entry_id)
         try:
             run_sync(delete())
+            logger.info("115 文件操作完成 library_id={} operation={} fid={}", self.library.library_id, "delete_media", entry.entry_id)
         except Cloud115NotFoundError:
+            logger.info("115 文件已不存在 library_id={} operation={} fid={}", self.library.library_id, "delete_media", entry.entry_id)
             return
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} fid={} error_type={} reason={}",
+                           self.library.library_id, "delete_media", entry.entry_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("delete_media", exc) from exc
 
     def compute_file_hash(self, *, media: MediaHandle) -> str:
@@ -776,6 +908,9 @@ class Cloud115StorageProvider:
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise _error("compute_file_hash", "invalid_config", "115 媒体文件大小无效")
 
+        started = time.monotonic()
+        logger.info("115 文件哈希开始 library_id={} media_id={} fid={} size_bytes={}",
+                    self.library.library_id, media.media_id, entry.entry_id, size)
         async def resolve():
             async with Cloud115Client(self._device_cookie) as client:
                 await asyncio.sleep(random.uniform(*_HASH_REQUEST_DELAY_RANGE))
@@ -787,8 +922,12 @@ class Cloud115StorageProvider:
         try:
             direct = run_sync(resolve())
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} media_id={} error_type={} reason={}",
+                           self.library.library_id, "compute_file_hash", media.media_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("compute_file_hash", exc) from exc
         if direct.file_size_bytes != size:
+            logger.warning("115 文件哈希大小校验失败 library_id={} media_id={} expected_size={} actual_size={}",
+                           self.library.library_id, media.media_id, size, direct.file_size_bytes)
             raise _error(
                 "compute_file_hash",
                 "unavailable",
@@ -798,6 +937,8 @@ class Cloud115StorageProvider:
         if size == 0:
             empty_sha1 = hashlib.sha1(b"").digest()
             payload = _HASH_DOMAIN + b"\x00full\x00" + (0).to_bytes(8, "big") + empty_sha1
+            logger.info("115 文件哈希完成 library_id={} media_id={} elapsed_seconds={:.2f}",
+                        self.library.library_id, media.media_id, time.monotonic() - started)
             return f"media-file-hash-v1:{hashlib.sha1(payload).hexdigest()}"
 
         reader = Cloud115RangeReader(
@@ -854,13 +995,25 @@ class Cloud115StorageProvider:
                     + middle_2_sha1
                 )
         except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} media_id={} error_type={} reason={}",
+                           self.library.library_id, "compute_file_hash", media.media_id, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("compute_file_hash", exc) from exc
         finally:
             reader.close()
+        logger.info("115 文件哈希完成 library_id={} media_id={} elapsed_seconds={:.2f}",
+                    self.library.library_id, media.media_id, time.monotonic() - started)
         return f"media-file-hash-v1:{hashlib.sha1(payload).hexdigest()}"
 
     async def handle_playback(self, *, media: MediaHandle, context: PlaybackContext) -> Response:
-        return await self._playback.handle(media=media, context=context)
+        try:
+            return await self._playback.handle(media=media, context=context)
+        except (ProviderOperationError, Cloud115Error) as exc:
+            cause = exc.__cause__
+            logger.warning("115 播放失败 library_id={} media_id={} delivery={} error_type={} reason={}",
+                           self.library.library_id, media.media_id, context.delivery,
+                           type(cause).__name__ if cause is not None else type(exc).__name__,
+                           safe_error_message(cause if cause is not None else exc))
+            raise
 
     async def handle_merged_playback(
         self,
@@ -868,7 +1021,15 @@ class Cloud115StorageProvider:
         medias: tuple[MediaHandle, ...],
         context: PlaybackContext,
     ) -> Response:
-        return await self._playback.handle_merged(medias=medias, context=context)
+        try:
+            return await self._playback.handle_merged(medias=medias, context=context)
+        except (ProviderOperationError, Cloud115Error) as exc:
+            cause = exc.__cause__
+            logger.warning("115 合并播放失败 library_id={} media_ids={} error_type={} reason={}",
+                           self.library.library_id, tuple(media.media_id for media in medias),
+                           type(cause).__name__ if cause is not None else type(exc).__name__,
+                           safe_error_message(cause if cause is not None else exc))
+            raise
 
     def open_cover_source(self, *, media: MediaHandle) -> Cloud115RangeReader:
         return self._range_reader(
@@ -889,15 +1050,20 @@ class Cloud115StorageProvider:
         try:
             targets, expected_count = run_sync(self._thumbnail_targets(media))
         except Cloud115VideoUnavailableError as exc:
+            logger.info("115 缩略图生成延期 library_id={} media_id={} reason={}", self.library.library_id, media.media_id, safe_error_message(exc))
             raise ThumbnailGenerationDeferred(
                 "115 视频转码尚未完成",
                 error_code="cloud115_video_transcoding",
                 max_deferred_attempts=5,
                 deferred_backoff_base_seconds=12 * 60 * 60,
             ) from exc
-        except Cloud115NotFoundError:
+        except Cloud115NotFoundError as exc:
+            logger.warning("115 缩略图目标不存在 library_id={} media_id={} reason={}",
+                           self.library.library_id, media.media_id, safe_error_message(exc))
             raise _error("generate_thumbnails", "source_not_found", "115 视频未提供 HLS") from None
         except Cloud115Error as exc:
+            logger.warning("115 缩略图目标解析失败 library_id={} media_id={} error_type={} reason={}",
+                           self.library.library_id, media.media_id, type(exc).__name__, safe_error_message(exc))
             raise ThumbnailBackendUnavailable(
                 "115 缩略图服务暂不可用", error_code="cloud115_thumbnail_unavailable"
             ) from exc
@@ -959,6 +1125,8 @@ class Cloud115StorageProvider:
                         artifacts.extend(generated)
                         generated_thumbnails += len(generated)
                     except Cloud115RequestError as exc:
+                        logger.warning("115 缩略图分片读取失败 library_id={} media_id={} segment_index={} reason={}",
+                                       self.library.library_id, media.media_id, futures[future], safe_error_message(exc))
                         raise ThumbnailBackendUnavailable(
                             "115 HLS 分片读取失败",
                             error_code="cloud115_thumbnail_unavailable",
@@ -968,7 +1136,7 @@ class Cloud115StorageProvider:
                             "115 HLS thumbnail segment failed media_id={} segment_index={} detail={}",
                             media.media_id,
                             futures[future],
-                            exc,
+                            safe_error_message(exc),
                         )
                 if (
                     completed_segments >= next_segment_log
@@ -1065,6 +1233,9 @@ class Cloud115StorageProvider:
         except ImportError as exc:
             raise _error("create_clip", "unavailable", "视频剪辑组件不可用", retryable=True) from exc
         workspace = _workspace(workspace, operation="create_clip")
+        started = time.monotonic()
+        logger.info("115 视频截取开始 library_id={} media_id={} start_seconds={} end_seconds={}",
+                    self.library.library_id, media.media_id, start_offset_seconds, end_offset_seconds)
         destination = workspace / "clip.mp4"
         temporary = workspace / ".clip.tmp.mp4"
         reader = self._range_reader(
@@ -1119,10 +1290,14 @@ class Cloud115StorageProvider:
             os.replace(temporary, destination)
             if not destination.is_file() or destination.stat().st_size <= 0:
                 raise ValueError("clip output empty")
+            logger.info("115 视频截取完成 library_id={} media_id={} elapsed_seconds={:.2f}",
+                        self.library.library_id, media.media_id, time.monotonic() - started)
             return ClipArtifact(relative_path=destination.name)
         except ProviderOperationError:
             raise
         except Exception as exc:
+            logger.error("115 视频截取失败 library_id={} media_id={} error_type={} reason={}",
+                         self.library.library_id, media.media_id, type(exc).__name__, safe_error_message(exc))
             raise _error("create_clip", "unavailable", "115 视频剪辑失败", retryable=True) from exc
         finally:
             if input_container is not None:
@@ -1149,6 +1324,8 @@ class Cloud115StorageProvider:
         try:
             direct = run_sync(resolve())
         except Cloud115Error as exc:
+            logger.warning("115 媒体读取地址解析失败 library_id={} media_id={} operation={} error_type={} reason={}",
+                           self.library.library_id, media.media_id, operation, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error(operation, exc) from exc
         size = direct.file_size_bytes or media.file_size_bytes
         if size <= 0:

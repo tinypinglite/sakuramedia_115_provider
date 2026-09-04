@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import httpx
+from loguru import logger
 from starlette.responses import (
     PlainTextResponse,
     RedirectResponse,
@@ -37,6 +38,7 @@ from .exceptions import (
     Cloud115NotFoundError,
     Cloud115RequestError,
     Cloud115VideoUnavailableError,
+    safe_error_message,
 )
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
@@ -315,7 +317,9 @@ class Cloud115Playback:
                     media=media, pickcode=pickcode, user_agent=user_agent
                 )
             return await self._proxy_root(media=media, pickcode=pickcode, context=context)
-        except Cloud115VideoUnavailableError:
+        except Cloud115VideoUnavailableError as exc:
+            logger.info("115 HLS 不可用，切换原文件代理 library_id={} media_id={} reason={}",
+                        media.library.library_id, media.media_id, safe_error_message(exc))
             return await self._direct_relay(media=media, pickcode=pickcode, context=context)
         except Cloud115Error as exc:
             raise _cloud_error("playback", exc) from exc
@@ -347,6 +351,8 @@ class Cloud115Playback:
     async def _resolve_hls_redirect(
         self, key: tuple[object, ...], pickcode: str, user_agent: str
     ) -> _HlsRedirectEntry:
+        started = time.monotonic()
+        logger.info("115 直连 HLS 解析开始 library_id={} media_id={}", key[0], key[1])
         try:
             try:
                 # 交互式播放解析不进入批量请求间隔队列。
@@ -359,6 +365,9 @@ class Cloud115Playback:
                 playlist_url = choose_hls_definition(info.definitions).playlist_url
             except Cloud115VideoUnavailableError:
                 playlist_url = None
+            logger.info("115 直连 HLS 解析完成 library_id={} media_id={} source={} elapsed_seconds={:.2f}",
+                        key[0], key[1], "hls" if playlist_url is not None else "original",
+                        time.monotonic() - started)
             return _CACHE.put_hls_redirect(key, playlist_url)
         finally:
             _CACHE.hls_redirect_tasks.pop(key, None)
@@ -420,11 +429,15 @@ class Cloud115Playback:
         entry = _CACHE.direct_for(key)
         if entry is not None:
             return key, entry
+        started = time.monotonic()
+        logger.info("115 原文件播放地址解析开始 library_id={} media_id={}", media.library.library_id, media.media_id)
         try:
             async with Cloud115Client(self._device_cookie) as client:
                 direct = await client.get_download_url(pickcode, user_agent=user_agent)
         except Cloud115Error as exc:
             raise _cloud_error("playback", exc) from exc
+        logger.info("115 原文件播放地址解析完成 library_id={} media_id={} elapsed_seconds={:.2f}",
+                    media.library.library_id, media.media_id, time.monotonic() - started)
         return key, _CACHE.put_direct(key, direct)
 
     async def _proxy_root(
@@ -438,9 +451,13 @@ class Cloud115Playback:
         )
 
     async def _resolve_hls(self, *, media: MediaHandle, pickcode: str) -> _HlsEntry:
+        started = time.monotonic()
+        logger.info("115 代理 HLS 解析开始 library_id={} media_id={}", media.library.library_id, media.media_id)
         async with Cloud115Client(self._device_cookie) as client:
             info = await client.get_video_info(pickcode)
             segments = await client.get_video_segments(choose_hls_definition(info.definitions))
+        logger.info("115 代理 HLS 解析完成 library_id={} media_id={} segments={} elapsed_seconds={:.2f}",
+                    media.library.library_id, media.media_id, len(segments), time.monotonic() - started)
         return _CACHE.put_hls(
             library_id=media.library.library_id,
             media_id=media.media_id,
@@ -466,6 +483,8 @@ class Cloud115Playback:
         if cached is not None:
             return cached
 
+        started = time.monotonic()
+        logger.info("115 合并 HLS 解析开始 library_id={} media_ids={}", library_id, media_ids)
         segments_by_part: list[tuple[Cloud115VideoSegment, ...]] = []
         async with Cloud115Client(
             self._device_cookie, pace_webapi=False
@@ -478,6 +497,8 @@ class Cloud115Playback:
                 if not segments:
                     raise Cloud115RequestError("115 HLS 分片为空")
                 segments_by_part.append(segments)
+        logger.info("115 合并 HLS 解析完成 library_id={} media_ids={} parts={} elapsed_seconds={:.2f}",
+                    library_id, media_ids, len(segments_by_part), time.monotonic() - started)
         return _CACHE.put_merged_hls(
             library_id=library_id,
             media_ids=media_ids,
@@ -516,6 +537,8 @@ class Cloud115Playback:
                 raise _provider_error("playback", "unavailable", "115 HLS 分片读取失败", retryable=True) from exc
         except Cloud115RequestError:
             pass
+        logger.warning("115 HLS 分片读取失败，刷新播放地址 library_id={} media_id={} segment_index={}",
+                       media.library.library_id, media.media_id, index)
         # A signed HLS URL can expire independently. Refresh once and retry the
         # same segment index; retrying repeatedly would turn a player loop into
         # uncontrolled traffic.
@@ -580,6 +603,8 @@ class Cloud115Playback:
                 ) from exc
         except Cloud115RequestError:
             pass
+        logger.warning("115 合并 HLS 分片读取失败，刷新播放地址 library_id={} media_id={} part_index={} segment_index={}",
+                       medias[part_index].library.library_id, medias[part_index].media_id, part_index, segment_index)
         try:
             async with Cloud115Client(self._device_cookie) as client:
                 info = await client.get_video_info(pickcodes[part_index])
@@ -625,6 +650,8 @@ class Cloud115Playback:
             except _UpstreamStatus as exc:
                 if attempt or exc.status_code not in {401, 403}:
                     raise _provider_error("playback", "unavailable", "115 直链读取失败", retryable=True) from exc
+                logger.warning("115 原文件播放地址失效，重新解析 library_id={} media_id={} status={}",
+                               media.library.library_id, media.media_id, exc.status_code)
                 _CACHE.discard_direct(key)
                 _, entry = await self._direct_entry(
                     media=media,
@@ -698,6 +725,10 @@ class Cloud115Playback:
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
+            except httpx.RequestError as exc:
+                logger.warning("115 播放流传输中断 resource={} error_type={}",
+                               request.resource_path or "original", type(exc).__name__)
+                raise
             finally:
                 await upstream.aclose()
                 await client.aclose()
