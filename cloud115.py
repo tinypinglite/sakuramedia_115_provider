@@ -385,6 +385,7 @@ class Cloud115Client:
             errno in _NOT_FOUND_ERRNOS
             or (endpoint_path == "/category/get" and errno == 70005)
             or (endpoint_path == "/files/get_info" and errno == 20018)
+            or (endpoint_path == "/files/get_info" and errno == 800001)
         ):
             return Cloud115NotFoundError(message)
         if errno in _DUPLICATE_NAME_ERRNOS:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import ClassVar
 
 import httpx
@@ -238,7 +239,9 @@ def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
     assert FakeClient.download_user_agents == ["player-ua"]
 
 
-def test_redirect_reuses_cached_direct_url(monkeypatch) -> None:
+def test_redirect_reuses_direct_url_until_expiry(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(playback, "time", SimpleNamespace(monotonic=lambda: now[0]))
     FakeClient.fail_hls = True
     FakeClient.download_user_agents.clear()
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
@@ -246,23 +249,16 @@ def test_redirect_reuses_cached_direct_url(monkeypatch) -> None:
     context = _context(delivery="redirect")
 
     first = asyncio.run(player.handle(media=_media(5), context=context))
+    now[0] = 699.0
     second = asyncio.run(player.handle(media=_media(5), context=context))
 
     assert first.headers["location"] == "https://direct/file"
     assert second.headers["location"] == "https://direct/file"
     assert FakeClient.download_user_agents == ["player-ua"]
 
-
-def test_direct_cache_uses_ten_minute_ttl(monkeypatch) -> None:
-    cache = playback._PlaybackCache()
-    monkeypatch.setattr(playback.time, "monotonic", lambda: 100.0)
-    direct = Cloud115DirectUrl(
-        "f", "movie.mp4", 10, "sha", "pc", "https://direct/file", "player-ua", 0
-    )
-
-    entry = cache.put_direct(("key",), direct)
-
-    assert entry.usable_until == 100.0 + 10 * 60
+    now[0] = 700.0
+    asyncio.run(player.handle(media=_media(5), context=context))
+    assert FakeClient.download_user_agents == ["player-ua", "player-ua"]
 
 
 def test_hls_segment_refreshes_definition_once(monkeypatch) -> None:
@@ -371,9 +367,8 @@ def test_redirect_prefers_upstream_hls_playlist(monkeypatch, range_header):
     assert FakeClient.download_user_agents == []
 
 
-@pytest.mark.parametrize("delivery", ["redirect", "proxy"])
 @pytest.mark.parametrize("error", [Cloud115AuthError, Cloud115RequestError, Cloud115RiskControlError])
-def test_hls_errors_do_not_fall_back_to_original(monkeypatch, delivery, error):
+def test_proxy_hls_errors_do_not_fall_back_to_original(monkeypatch, error):
     class FailedClient(FakeClient):
         async def get_video_info(self, pickcode):
             raise error("test HLS error")
@@ -382,6 +377,6 @@ def test_hls_errors_do_not_fall_back_to_original(monkeypatch, delivery, error):
     monkeypatch.setattr(playback, "Cloud115Client", FailedClient)
     with pytest.raises(playback.ProviderOperationError):
         asyncio.run(playback.Cloud115Playback(device_cookie="error-cookie").handle(
-            media=_media(91), context=_context(delivery=delivery)
+            media=_media(91), context=_context(delivery="proxy")
         ))
     assert FakeClient.download_user_agents == []

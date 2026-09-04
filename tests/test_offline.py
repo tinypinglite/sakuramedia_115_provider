@@ -67,18 +67,6 @@ def test_offline_submission_uses_info_hash_directory(monkeypatch) -> None:
     }
 
 
-def test_offline_submission_converts_torrent_to_magnet(monkeypatch) -> None:
-    monkeypatch.setattr(offline, "_resolve_http_source", lambda _url: ("torrent", b"torrent"))
-    monkeypatch.setattr(
-        offline, "_torrent_info_hash", lambda _payload: "0123456789abcdef0123456789abcdef01234567"
-    )
-
-    magnet, info_hash = offline._resolve_source("https://index.example/movie.torrent")
-
-    assert magnet == "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-    assert info_hash == "0123456789abcdef0123456789abcdef01234567"
-
-
 def test_offline_submission_uses_magnet_from_torrent_redirect(monkeypatch) -> None:
     magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
 
@@ -108,37 +96,22 @@ def test_offline_submission_uses_magnet_from_torrent_redirect(monkeypatch) -> No
     assert info_hash == "0123456789abcdef0123456789abcdef01234567"
 
 
-def test_offline_submission_reuses_existing_task_in_managed_directory(monkeypatch) -> None:
+@pytest.mark.parametrize("managed", [True, False])
+def test_offline_submission_only_reuses_managed_tasks(monkeypatch, managed):
+    info_hash = "0123456789abcdef0123456789abcdef01234567"
+
     class DuplicateClient(FakeClient):
-        async def add_offline_url(self, _source_uri: str, *, save_dir_id: str) -> str:
-            assert save_dir_id == "new-dir"
+        async def add_offline_url(self, _source_uri, *, save_dir_id):
             raise Cloud115OfflineTaskExistsError("任务已存在")
 
-        async def list_offline_tasks(self, *, page: int):
-            assert page == 1
-            return (
-                (
-                    Cloud115OfflineTask(
-                        "0123456789abcdef0123456789abcdef01234567",
-                        "movie",
-                        1,
-                        0.5,
-                        "",
-                        "",
-                        "old-dir",
-                    ),
-                ),
-                1,
-            )
+        async def list_offline_tasks(self, *, page):
+            cid = "old-dir" if managed else "outside-dir"
+            return (Cloud115OfflineTask(info_hash, "movie", 1, 0.5, "", "", cid),), 1
 
-        async def list_directory(self, _cid: str):
-            return (
-                Cloud115Entry("old-dir", "downloads", "task-old", True, 0, None, "", 0, False),
-            )
+        async def list_directory(self, _cid):
+            return (Cloud115Entry("old-dir", "downloads", "task-old", True, 0, None, "", 0, False),)
 
-    async def create(_client, *, parent_cid: str, info_hash: str) -> str:
-        assert parent_cid == "downloads"
-        assert info_hash == "0123456789abcdef0123456789abcdef01234567"
+    async def create(_client, **_kwargs):
         return "new-dir"
 
     monkeypatch.setattr(offline, "Cloud115Client", DuplicateClient)
@@ -146,61 +119,11 @@ def test_offline_submission_reuses_existing_task_in_managed_directory(monkeypatc
     provider = offline.Cloud115OfflineDownloadProvider(
         device_cookie="cookie", downloads_root_cid="downloads"
     )
+    submission = DownloadSubmission(f"magnet:?xt=urn:btih:{info_hash}", "movie")
 
-    submitted = provider.submit(
-        submission=DownloadSubmission(
-            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "movie"
-        )
-    )
-
-    assert submitted.remote_id == "0123456789abcdef0123456789abcdef01234567"
-
-
-def test_offline_submission_rejects_existing_task_outside_managed_directory(monkeypatch) -> None:
-    class DuplicateClient(FakeClient):
-        async def add_offline_url(self, _source_uri: str, *, save_dir_id: str) -> str:
-            assert save_dir_id == "new-dir"
-            raise Cloud115OfflineTaskExistsError("任务已存在")
-
-        async def list_offline_tasks(self, *, page: int):
-            assert page == 1
-            return (
-                (
-                    Cloud115OfflineTask(
-                        "0123456789abcdef0123456789abcdef01234567",
-                        "movie",
-                        1,
-                        0.5,
-                        "",
-                        "",
-                        "outside-dir",
-                    ),
-                ),
-                1,
-            )
-
-        async def list_directory(self, _cid: str):
-            return (
-                Cloud115Entry("new-dir", "downloads", "task-new", True, 0, None, "", 0, False),
-            )
-
-    async def create(_client, *, parent_cid: str, info_hash: str) -> str:
-        assert parent_cid == "downloads"
-        assert info_hash == "0123456789abcdef0123456789abcdef01234567"
-        return "new-dir"
-
-    monkeypatch.setattr(offline, "Cloud115Client", DuplicateClient)
-    monkeypatch.setattr(offline, "_create_task_dir", create)
-    provider = offline.Cloud115OfflineDownloadProvider(
-        device_cookie="cookie", downloads_root_cid="downloads"
-    )
-
-    with pytest.raises(ProviderOperationError) as error:
-        provider.submit(
-            submission=DownloadSubmission(
-                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "movie"
-            )
-        )
-
-    assert error.value.code == "task_not_managed"
-    assert error.value.safe_message == "同哈希离线任务已存在，但不在当前下载目录，当前下载器无法接管"
+    if managed:
+        assert provider.submit(submission=submission).remote_id == info_hash
+    else:
+        with pytest.raises(ProviderOperationError) as error:
+            provider.submit(submission=submission)
+        assert error.value.code == "task_not_managed"

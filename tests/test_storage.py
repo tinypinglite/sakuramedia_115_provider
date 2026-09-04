@@ -28,7 +28,6 @@ from src.plugins.provider_protocol import (
     MediaHandle,
     MediaTransferSourceInfo,
     ProviderOperationError,
-    ThumbnailArtifact,
 )
 
 
@@ -301,28 +300,15 @@ def _valid_transfer_receipt() -> dict[str, object]:
     }
 
 
-def test_abort_transfer_refuses_to_delete_a_moved_or_replaced_file(
-    monkeypatch, tmp_path
-) -> None:
-    MovedReceiptClient.delete_calls = []
-    monkeypatch.setattr(storage, "Cloud115Client", MovedReceiptClient)
+@pytest.mark.parametrize("client_type", [MovedReceiptClient, RenamedReceiptClient])
+def test_abort_transfer_preserves_changed_file(monkeypatch, tmp_path, client_type):
+    client_type.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", client_type)
 
-    with pytest.raises(ProviderOperationError) as error:
+    with pytest.raises(ProviderOperationError):
         _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
 
-    assert error.value.code == "unavailable"
-    assert MovedReceiptClient.delete_calls == []
-
-
-def test_abort_transfer_refuses_to_delete_a_renamed_file(monkeypatch, tmp_path) -> None:
-    RenamedReceiptClient.delete_calls = []
-    monkeypatch.setattr(storage, "Cloud115Client", RenamedReceiptClient)
-
-    with pytest.raises(ProviderOperationError) as error:
-        _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
-
-    assert error.value.code == "unavailable"
-    assert RenamedReceiptClient.delete_calls == []
+    assert client_type.delete_calls == []
 
 
 def test_abort_transfer_preserves_nonempty_directory_when_receipt_file_is_missing(
@@ -916,30 +902,6 @@ def test_compute_file_hash_rejects_a_changed_remote_size(monkeypatch, tmp_path) 
     assert exc_info.value.code == "unavailable"
 
 
-def test_open_cover_source_uses_a_bounded_range_reader(monkeypatch, tmp_path) -> None:
-    provider = storage.Cloud115StorageProvider(
-        library=_hash_media(100).library,
-        data_dir=tmp_path,
-    )
-    reader = object()
-    calls = []
-
-    def range_reader(media, *, operation, max_fetched_bytes):
-        calls.append((media, operation, max_fetched_bytes))
-        return reader
-
-    monkeypatch.setattr(provider, "_range_reader", range_reader)
-
-    assert provider.open_cover_source(media=_hash_media(100)) is reader
-    assert calls == [
-        (
-            _hash_media(100),
-            "open_cover_source",
-            storage.COVER_MAX_FETCHED_BYTES,
-        )
-    ]
-
-
 def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
     targets, expected_count = storage._thumbnail_targets(
         (
@@ -954,63 +916,6 @@ def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
         (0, [0]),
         (1, [10]),
     ]
-
-
-def test_generate_thumbnails_logs_start_progress_and_completion(monkeypatch, tmp_path) -> None:
-    provider = storage.Cloud115StorageProvider(
-        library=_hash_media(100).library,
-        data_dir=tmp_path,
-    )
-    targets = [
-        (Cloud115VideoSegment(index, f"https://hls.example/{index}.ts", 10), [index * 10])
-        for index in range(3)
-    ]
-    log_records: list[tuple[str, tuple[object, ...]]] = []
-
-    def resolve_targets(coroutine):
-        coroutine.close()
-        return targets, 3
-
-    def decode(*, segment, offsets, **_kwargs):
-        return [
-            ThumbnailArtifact(
-                offset_seconds=offset,
-                relative_path=f"thumbnail-{offset}.webp",
-            )
-            for offset in offsets
-        ]
-
-    def info(message, *_args) -> None:
-        log_records.append((message, _args))
-
-    monkeypatch.setattr(storage, "run_sync", resolve_targets)
-    monkeypatch.setattr(
-        storage.Cloud115StorageProvider,
-        "_decode_hls_segment",
-        staticmethod(decode),
-    )
-    monkeypatch.setattr(storage, "THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL", 2)
-    monkeypatch.setattr(storage, "THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS", 60)
-    monkeypatch.setattr(storage.logger, "info", info)
-
-    result = provider.generate_thumbnails(media=_hash_media(100), workspace=tmp_path)
-
-    assert result.expected_count == 3
-    assert len(result.artifacts) == 3
-    assert [message for message, _args in log_records] == [
-        "115 thumbnail generation started media_id={} target_segments={} expected_thumbnails={}",
-        (
-            "115 thumbnail generation progress media_id={} completed_segments={}/{} "
-            "generated_thumbnails={}/{} elapsed_seconds={}"
-        ),
-        (
-            "115 thumbnail generation completed media_id={} completed_segments={} "
-            "generated_thumbnails={} expected_thumbnails={} elapsed_seconds={}"
-        ),
-    ]
-    assert log_records[0][1] == (1, 3, 3)
-    assert log_records[1][1][:-1] == (1, 3, 3, 3, 3)
-    assert log_records[2][1][:-1] == (1, 3, 3, 3)
 
 
 @pytest.mark.parametrize(

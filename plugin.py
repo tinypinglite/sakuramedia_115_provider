@@ -6,7 +6,6 @@ import json
 from pathlib import Path, PurePosixPath
 
 from src.plugins import (
-    HOST_API_VERSION,
     PluginContext,
     PluginExtension,
     PluginRegistration,
@@ -19,7 +18,13 @@ from src.plugins.provider_protocol import (
     PreparedLibrary,
     ProviderOperationError,
 )
+from src.scheduler.contracts import JobDefinition
 
+from .cleanup import (
+    CleanupConfirmParams,
+    cleanup_empty_media_dirs,
+    cleanup_imported_downloads,
+)
 from .cloud115 import (
     Cloud115Client,
     exchange_web_cookie_for_alipaymini,
@@ -30,9 +35,11 @@ from .offline import Cloud115OfflineDownloadComponent
 
 PLUGIN_ID = "sakuramedia_115_provider"
 DISPLAY_NAME = "115 网盘"
-VERSION = json.loads(
+MANIFEST = json.loads(
     Path(__file__).with_name("manifest.json").read_text(encoding="utf-8")
-)["version"]
+)
+VERSION = MANIFEST["version"]
+HOST_API_VERSION = MANIFEST["host_api_version"]
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
@@ -182,11 +189,32 @@ class Cloud115MediaProviderBundle:
 
 def register(context: PluginContext) -> PluginRegistration:
     bundle = Cloud115MediaProviderBundle(data_dir=context.data_dir)
+
     return PluginRegistration(
         plugin_id=PLUGIN_ID,
         display_name=DISPLAY_NAME,
         version=VERSION,
         host_api_version=HOST_API_VERSION,
+        jobs=(
+            JobDefinition(
+                task_key="sakuramedia_115_cleanup_imported_downloads",
+                log_name="115-cleanup-imported-downloads",
+                cli_name="115-cleanup-imported-downloads",
+                cli_help="删除已验证的 115 下载源目录",
+                manual_only=True,
+                params_schema=CleanupConfirmParams,
+                handler=cleanup_imported_downloads,
+            ),
+            JobDefinition(
+                task_key="sakuramedia_115_cleanup_empty_media_dirs",
+                log_name="115-cleanup-empty-media-dirs",
+                cli_name="115-cleanup-empty-media-dirs",
+                cli_help="删除 115 媒体目录下的空子目录",
+                manual_only=True,
+                params_schema=CleanupConfirmParams,
+                handler=cleanup_empty_media_dirs,
+            ),
+        ),
         extensions=(PluginExtension(key=MEDIA_PROVIDER_EXTENSION_KEY, data=bundle),),
     )
 

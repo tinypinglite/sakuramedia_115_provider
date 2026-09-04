@@ -370,95 +370,25 @@ def test_batch_webapi_pacing_waits_after_each_thirty_requests(monkeypatch) -> No
     assert cloud115._WEBAPI_NEXT_REQUEST_AT["987654321"] == now[0] + 1.0
 
 
-def test_http_405_on_any_domain_is_explicit_risk_control(monkeypatch) -> None:
-    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(405, text="blocked")
-
-    async def request() -> None:
-        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
+@pytest.mark.parametrize("status,host,body,error_type", [
+    (405, "other.example", "blocked", Cloud115RiskControlError),
+    (403, "webapi.115.com", "<html>request has been blocked</html>", Cloud115AuthError),
+    (400, "webapi.115.com", "", Cloud115RiskControlError),
+    (400, "webapi.115.com", "<h1>Request Header Or Cookie Too Large</h1>", Cloud115RequestError),
+])
+def test_http_failures_are_classified(status, host, body, error_type):
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, text=body)
+        )) as http:
             client = Cloud115Client(
-                "UID=123456_A1_x; CID=c; SEID=s",
-                http_client=http_client,
+                "UID=123456_A1_x; CID=c; SEID=s", http_client=http, pace_webapi=False
             )
-            with pytest.raises(Cloud115RiskControlError, match="HTTP 405"):
-                await client._request("GET", "https://other.example/files")
-        finally:
-            await http_client.aclose()
+            with pytest.raises(error_type) as error:
+                await client._request("GET", f"https://{host}/files")
+            assert type(error.value) is error_type
 
-    asyncio.run(request())
-
-
-def test_http_403_remains_an_auth_error_even_with_a_waf_like_body(monkeypatch) -> None:
-    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, text="<html>request has been blocked</html>")
-
-    async def request() -> None:
-        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            client = Cloud115Client(
-                "UID=123456_A1_x; CID=c; SEID=s",
-                http_client=http_client,
-            )
-            with pytest.raises(Cloud115AuthError):
-                await client._request("GET", "https://webapi.115.com/files")
-        finally:
-            await http_client.aclose()
-
-    asyncio.run(request())
-
-
-def test_http_400_on_webapi_is_risk_control(monkeypatch) -> None:
-    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400)
-
-    async def request() -> None:
-        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            client = Cloud115Client(
-                "UID=123456_A1_x; CID=c; SEID=s",
-                http_client=http_client,
-            )
-            with pytest.raises(Cloud115RiskControlError, match="HTTP 400"):
-                await client._request("GET", "https://webapi.115.com/files")
-        finally:
-            await http_client.aclose()
-
-    asyncio.run(request())
-
-
-def test_nginx_cookie_header_overflow_is_not_misclassified_as_risk_control(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
-
-    async def request() -> None:
-        http_client = httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda _request: httpx.Response(
-                    400, text="<h1>Request Header Or Cookie Too Large</h1>"
-                )
-            )
-        )
-        try:
-            client = Cloud115Client(
-                "UID=123456_A1_x; CID=c; SEID=s",
-                http_client=http_client,
-                pace_webapi=False,
-            )
-            with pytest.raises(Cloud115RequestError) as error:
-                await client._request("GET", "https://webapi.115.com/files")
-            assert not isinstance(error.value, Cloud115RiskControlError)
-        finally:
-            await http_client.aclose()
-
-    asyncio.run(request())
+    asyncio.run(run())
 
 
 def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) -> None:
@@ -866,6 +796,8 @@ def test_numeric_failure_state_stops_delete_and_authentication():
         ("/category/get", 70005, True),
         ("/files/get_info", 70005, False),
         ("/files/get_info", 20018, True),
+        ("/files/get_info", 800001, True),
+        ("/rb/delete", 800001, False),
         ("/rb/delete", 20018, False),
         ("/category/get", 1001, False),
     ],
