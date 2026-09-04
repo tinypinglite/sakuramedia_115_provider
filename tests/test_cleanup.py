@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import pytest
 from sakuramedia_115_provider import cleanup
-from sakuramedia_115_provider.cloud115 import Cloud115DirectoryInfo
 
 SHA1 = "A" * 40
 
@@ -40,7 +39,6 @@ class TreeClient:
     def __init__(self):
         self.tree = {}
         self.files = {}
-        self.directories = {}
         self.tasks = ()
         self.deleted = []
 
@@ -50,15 +48,21 @@ class TreeClient:
     async def __aexit__(self, *_exc):
         pass
 
-    async def list_directory(self, cid):
-        return self.tree[cid]
+    async def file_by_id(self, cid):
+        return SimpleNamespace(pickcode=cid, entry_id=cid, is_dir=True)
+
+    async def iter_download_nodes(self, pickcode, *, directories, progress):
+        for entries in self.tree.values():
+            for entry in entries:
+                if entry.is_dir == directories:
+                    if directories:
+                        yield {"fid": entry.entry_id, "pid": entry.parent_id, "fn": entry.name}
+                    else:
+                        yield {"pid": entry.parent_id, "fs": entry.size_bytes}
 
     async def iter_files_recursive(self, cid):
         for entry in self.files[cid]:
             yield entry
-
-    async def directory_info(self, cid):
-        return self.directories[cid]
 
     async def list_offline_tasks(self, *, page):
         return self.tasks, 1
@@ -102,10 +106,7 @@ def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(
         video("completed"),
         video("wrong-size", size=101),
     )
-    client.directories["nested"] = Cloud115DirectoryInfo(
-        name="nested",
-        ancestors=(("root", "downloads"), ("imported", "task-imported")),
-    )
+    client.tree["imported"] = (directory("nested", "imported"),)
     client.tasks = (
         SimpleNamespace(save_dir_id="active", status=1),
         SimpleNamespace(save_dir_id="completed", status=2),
@@ -157,10 +158,10 @@ def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(clien
     assert result["scanned_directories"] == 7
     assert result["skipped_directories"] == 1
     assert reporter.summary == result
-    assert any("当前目录 root" in event.get("text", "") for event in reporter.events)
+    assert any("正在读取媒体库根目录…" in event.get("text", "") for event in reporter.events)
     assert any(event.get("current") == event.get("total") == 3 for event in reporter.events)
-    assert any("保留目录" in message and "cid=changed" in message for message in log_messages)
-    assert any("已删除目录" in message and "cid=outer" in message for message in log_messages)
+    assert any("保留目录" in message and "cid=changed" in message and "path=/task-changed" in message for message in log_messages)
+    assert any("已删除目录" in message and "cid=outer" in message and "path=/task-outer" in message for message in log_messages)
 
 
 @pytest.mark.parametrize(
@@ -215,10 +216,10 @@ def test_cleanup_reports_directory_stage_before_waiting_for_115(client, monkeypa
     reporter = Reporter()
 
     async def fail_directory_info(cid):
-        assert reporter.events[-1]["text"].endswith("核对目录归属：0/1")
+        assert reporter.events[-1]["text"].endswith("正在读取媒体库根目录…")
         raise cleanup.Cloud115Error("115 unavailable")
 
-    monkeypatch.setattr(client, "directory_info", fail_directory_info)
+    monkeypatch.setattr(client, "file_by_id", fail_directory_info)
     with pytest.raises(cleanup.Cloud115Error, match="cleanup failed"):
         cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
     assert not client.deleted
@@ -266,3 +267,29 @@ def test_cleanup_continues_other_libraries_after_failure(client, monkeypatch):
     assert client.deleted == [(["a"], "root")]
     assert reporter.summary["deleted_directories"] == 1
     assert reporter.summary["libraries"] == 2
+
+
+@pytest.mark.parametrize("invalid", ["orphan", "cycle", "unknown_file_parent"])
+def test_empty_cleanup_rejects_incomplete_tree_before_deletion(client, invalid):
+    client.tree = {"root": (directory("empty"),)}
+    if invalid == "orphan":
+        client.tree["bad"] = (directory("orphan", "missing"),)
+    elif invalid == "cycle":
+        client.tree["bad"] = (directory("a", "b"), directory("b", "a"))
+    else:
+        client.tree["bad"] = (video("missing"),)
+    result = cleanup.cleanup_empty_media_dirs(Reporter(), {"confirm": True})
+    assert result["failed_libraries"] == 1
+    assert client.deleted == []
+
+
+def test_empty_cleanup_preserves_zero_byte_files_and_selects_maximal_subtrees(client):
+    client.tree = {
+        "root": (directory("empty"), directory("occupied")),
+        "empty": (directory("child", "empty"),),
+        "occupied": (video("occupied", size=0),),
+    }
+    client.files["empty"] = ()
+    result = cleanup.cleanup_empty_media_dirs(Reporter(), {"confirm": True})
+    assert result["failed_libraries"] == 0
+    assert client.deleted == [(["empty"], "root")]

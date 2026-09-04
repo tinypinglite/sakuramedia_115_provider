@@ -447,6 +447,45 @@ class Cloud115Client:
             raise Cloud115RequestError("115 登录状态探测返回无效数据")
         return payload["state"] is True
 
+    async def iter_download_nodes(
+        self, pickcode: str, *, directories: bool, progress: Callable[[dict[str, Any]], None]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Read the complete subtree slim list; count is per page, not a total."""
+        if not pickcode:
+            raise Cloud115Error("115 目录缺少 pickcode，无法读取子树简表")
+        endpoint = "downfolders" if directories else "downfiles"
+        stage = "读取目录简表" if directories else "读取文件简表"
+        page, count = 1, 0
+        seen: set[str] = set()
+        while True:
+            progress({"text": stage, "detail": f"正在读取第 {page} 页，已读取 {count} 条", "current": count, "total": 0})
+            payload = await self._json(
+                "GET", f"https://webapi.115.com/files/{endpoint}",
+                params={"pickcode": pickcode, "page": page, "per_page": 5000},
+            )
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise Cloud115Error("115 子树简表缺少数据")
+            rows, has_next = data.get("list"), data.get("has_next_page")
+            if (not isinstance(rows, list) or type(has_next) is not bool
+                    or data.get("count") != len(rows) or (has_next and not rows)):
+                raise Cloud115Error("115 子树简表分页数据不完整")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise Cloud115Error("115 子树简表记录无效")
+                identity = str(row.get("fid" if directories else "pc") or "")
+                parent = row.get("pid")
+                if (not identity or identity in seen or parent is None or str(parent) == ""
+                        or (directories and not isinstance(row.get("fn"), str))):
+                    raise Cloud115Error("115 子树简表记录缺失或重复")
+                seen.add(identity)
+                yield row
+            count += len(rows)
+            progress({"text": stage, "detail": f"已读取 {page} 页、{count} 条", "current": count, "total": 0 if has_next else count})
+            if not has_next:
+                return
+            page += 1
+
     async def list_dir(
         self,
         cid: str,

@@ -85,6 +85,7 @@ class _CleanupProgress:
         self.reporter = reporter
         self.label = label
         self.detail = ""
+        self.location = None
         self.library = ""
         self.stage = ""
         self.current = self.total = 0
@@ -98,6 +99,7 @@ class _CleanupProgress:
         force = (
             stage != self.stage or (total > 0 and current == total) or wait is not None
         )
+        self.location = payload.get("location", self.location if stage == self.stage else None)
         self.detail = payload.get("detail", self.detail if stage == self.stage else "")
         self.stage, self.current, self.total = stage, current, total
         text = f"{self.library}{stage}"
@@ -113,11 +115,14 @@ class _CleanupProgress:
                 "{} task_run_id={} {}",
                 self.label,
                 getattr(self.reporter, "task_run_id", None),
-                text,
+                text + (f" cid={self.location[0]}" if self.location else ""),
             )
             self.last_log = now
         if force or now - self.last_report >= 2:
             if self.reporter is not None:
+                if self.location and len(self.location[1]) > 100:
+                    path = self.location[1]
+                    text = text.replace(path, path[:40] + "…" + path[-59:])
                 self.reporter.progress_callback(
                     {"text": text, "current": current, "total": total}
                 )
@@ -213,24 +218,18 @@ async def _cleanup_download_group(
         if not relevant_entries:
             return result
 
-        progress({"text": "读取下载根目录", "current": 0, "total": 0})
-        root_entries = await client.list_directory(root_cid)
+        _pickcode, directories, _paths = await _load_directory_tree(client, root_cid, progress)
         direct_dirs = {
-            entry.entry_id: entry
-            for entry in root_entries
-            if entry.is_dir and entry.parent_id == root_cid
+            cid: node for cid, node in directories.items() if node["pid"] == root_cid
         }
         parent_ids = {
             entry.parent_id
             for entry in relevant_entries
             if entry.parent_id and entry.parent_id != root_cid
         }
-        parent_to_top = await _resolve_top_level_directories(
-            client=client,
-            root_cid=root_cid,
-            direct_dirs=direct_dirs,
-            parent_ids=parent_ids,
-            progress=progress,
+        parent_to_top = _resolve_top_level_directories(
+            root_cid=root_cid, directories=directories,
+            parent_ids=parent_ids, progress=progress,
         )
         grouped: dict[str, list[Any]] = defaultdict(list)
         unresolved = False
@@ -259,7 +258,7 @@ async def _cleanup_download_group(
         managed_ids = {
             cid
             for cid, entry in direct_dirs.items()
-            if _is_managed_download_directory(entry.name)
+            if _is_managed_download_directory(entry["fn"])
         }
         candidate_ids = set(grouped) & managed_ids
         protected_ids = await _list_existing_offline_task_directories(
@@ -293,7 +292,7 @@ async def _cleanup_download_group(
                     "115 下载清理保留目录 library_id={} cid={} name={} reason={}",
                     library.id,
                     cid,
-                    direct_dirs[cid].name,
+                    direct_dirs[cid]["fn"],
                     _SKIP_REASONS[reason],
                 )
                 continue
@@ -310,7 +309,7 @@ async def _cleanup_download_group(
                     "115 下载清理已删除目录 library_id={} cid={} name={}",
                     library.id,
                     cid,
-                    direct_dirs[cid].name,
+                    direct_dirs[cid]["fn"],
                 )
             progress(
                 {
@@ -355,7 +354,8 @@ async def _cleanup_empty_media_dirs(*, reporter: Any | None) -> dict[str, int]:
                 root_key="media_root_cid",
             )
             async with Cloud115Client(cookie, batch_pacing=True) as client:
-                deletions, scanned = await _find_empty_directories(client, root_cid, progress)
+                deletions, paths = await _find_empty_directories(client, root_cid, progress)
+                scanned = len(paths)
                 stats["scanned_directories"] += scanned
                 total = sum(len(ids) for ids in deletions.values())
                 stats["candidate_directories"] += total
@@ -369,27 +369,28 @@ async def _cleanup_empty_media_dirs(*, reporter: Any | None) -> dict[str, int]:
                         # 整棵子树复核无文件后才删除，避免沿用扫描阶段的判空结果。
                         empty = []
                         for cid in batch:
-                            progress({"detail": f"正在复核目录 {cid}"})
+                            progress({"detail": f"当前：{paths[cid]}", "location": (cid, paths[cid])})
                             async for _entry in client.iter_files_recursive(cid):
                                 stats["skipped_directories"] += 1
-                                logger.info("115 空目录清理保留目录 library_id={} cid={} reason=复核发现文件",
-                                            library.id, cid)
+                                logger.info("115 空目录清理保留目录 library_id={} cid={} path={} reason=复核发现文件",
+                                            library.id, cid, paths[cid])
                                 break
                             else:
                                 empty.append(cid)
                         if empty:
-                            progress({"detail": f"正在删除 {len(empty)} 个目录，父目录 {parent_cid}"})
+                            progress({"detail": f"正在删除 {len(empty)} 个目录，父目录：{paths[parent_cid]}",
+                                      "location": (parent_cid, paths[parent_cid])})
                             await client.delete_files(empty, parent_cid=parent_cid)
                             stats["deleted_directories"] += len(empty)
                             for cid in empty:
-                                logger.info("115 空目录清理已删除目录 library_id={} parent_cid={} cid={}",
-                                            library.id, parent_cid, cid)
+                                logger.info("115 空目录清理已删除目录 library_id={} parent_cid={} cid={} path={}",
+                                            library.id, parent_cid, cid, paths[cid])
                         processed += len(batch)
-                        progress({"current": processed, "detail": ""})
+                        progress({"current": processed, "detail": "", "location": None})
         except (Cloud115Error, OSError, TypeError, ValueError) as exc:
             stats["failed_libraries"] += 1
-            logger.warning("115 空目录清理失败 library_id={} stage={} detail={} error_type={} reason={}",
-                           library.id, progress.stage, progress.detail, type(exc).__name__, safe_error_message(exc))
+            logger.warning("115 空目录清理失败 library_id={} stage={} detail={} location={} error_type={} reason={}",
+                           library.id, progress.stage, progress.detail, progress.location, type(exc).__name__, safe_error_message(exc))
         if reporter is not None:
             reporter.progress_callback({"summary_patch": dict(stats)})
     stats["elapsed_seconds"] = round(time.monotonic() - started)
@@ -401,45 +402,56 @@ async def _cleanup_empty_media_dirs(*, reporter: Any | None) -> dict[str, int]:
     return stats
 
 
+async def _load_directory_tree(
+    client: Cloud115Client, root_cid: str, progress: _CleanupProgress
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    progress({"text": "读取目录简表", "detail": "正在读取媒体库根目录…", "current": 0, "total": 0})
+    if root_cid == "0":
+        raise Cloud115Error("115 账号根目录不支持子树简表，请配置具体目录")
+    root = await client.file_by_id(root_cid)
+    if not root.is_dir or root.entry_id != root_cid:
+        raise Cloud115Error("115 返回的根目录信息不一致")
+    nodes = {}
+    async for row in client.iter_download_nodes(root.pickcode, directories=True, progress=progress):
+        cid, parent = str(row["fid"]), str(row["pid"])
+        if cid == root_cid or cid in nodes:
+            raise Cloud115Error("115 目录简表包含根目录或重复目录")
+        nodes[cid] = {"pid": parent, "fn": row["fn"]}
+    paths = {root_cid: "/"}
+    for cid in nodes:
+        chain: list[str] = []
+        visiting: set[str] = set()
+        current = cid
+        while current not in paths:
+            if current not in nodes or current in visiting:
+                raise Cloud115Error("115 目录简表缺少父目录或存在循环")
+            visiting.add(current)
+            chain.append(current)
+            current = nodes[current]["pid"]
+        for child in reversed(chain):
+            node = nodes[child]
+            paths[child] = f"{paths[node['pid']].rstrip('/')}/{node['fn']}"
+    return root.pickcode, nodes, paths
+
+
 async def _find_empty_directories(
     client: Cloud115Client, root_cid: str, progress: _CleanupProgress
-) -> tuple[dict[str, list[str]], int]:
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    pickcode, nodes, paths = await _load_directory_tree(client, root_cid, progress)
+    occupied = {root_cid}
+    async for row in client.iter_download_nodes(pickcode, directories=False, progress=progress):
+        cid = str(row["pid"])
+        if cid not in paths:
+            raise Cloud115Error("115 文件简表包含未知父目录，停止清理")
+        while cid not in occupied:
+            occupied.add(cid)
+            cid = nodes[cid]["pid"]
     deletions: dict[str, list[str]] = defaultdict(list)
-    visited: set[str] = set()
-
-    async def visit(cid: str, *, is_root: bool) -> bool:
-        if cid in visited:
-            raise Cloud115Error("115 目录树存在循环")
-        visited.add(cid)
-        progress({"text": "扫描空目录", "current": len(visited) - 1, "total": 0,
-                  "detail": f"已扫描 {len(visited) - 1} 个目录，当前目录 {cid}"})
-        entries = await client.list_directory(cid)
-        has_file = False
-        has_non_empty_child = False
-        empty_children: list[str] = []
-        for entry in entries:
-            if not entry.is_dir:
-                has_file = True
-                continue
-            if entry.parent_id != cid:
-                raise Cloud115Error("115 目录列表的父目录不一致")
-            if await visit(entry.entry_id, is_root=False):
-                empty_children.append(entry.entry_id)
-            else:
-                has_non_empty_child = True
-        if not has_file and not has_non_empty_child:
-            if is_root:
-                # The configured root is never removed; only its empty direct
-                # children are candidates.
-                deletions[cid].extend(empty_children)
-                return False
-            return True
-        if empty_children:
-            deletions[cid].extend(empty_children)
-        return False
-
-    await visit(root_cid, is_root=True)
-    return dict(deletions), len(visited)
+    for cid, node in nodes.items():
+        if cid not in occupied and node["pid"] in occupied:
+            deletions[node["pid"]].append(cid)
+    logger.info("115 空目录筛选完成：directories={} candidates={}", len(nodes), sum(map(len, deletions.values())))
+    return dict(deletions), paths
 
 
 def _load_imported_media_groups() -> dict[int, tuple[Any, dict[str, set[int]]]]:
@@ -504,40 +516,18 @@ def _minimum_video_size_bytes() -> int:
     return value
 
 
-async def _resolve_top_level_directories(
-    *,
-    client: Any,
-    root_cid: str,
-    direct_dirs: dict[str, Any],
-    parent_ids: set[str],
+def _resolve_top_level_directories(
+    *, root_cid: str, directories: dict[str, Any], parent_ids: set[str],
     progress: _CleanupProgress,
 ) -> dict[str, str | None]:
     resolved: dict[str, str | None] = {}
     progress({"text": "核对目录归属", "current": 0, "total": len(parent_ids)})
     for parent_cid in sorted(parent_ids):
-        if parent_cid in direct_dirs:
-            resolved[parent_cid] = parent_cid
-            progress(
-                {
-                    "text": "核对目录归属",
-                    "current": len(resolved),
-                    "total": len(parent_ids),
-                }
-            )
-            continue
-        directory = await client.directory_info(parent_cid)
-        found_root = False
-        top_cid: str | None = None
-        for ancestor_cid, _ancestor_name in directory.ancestors:
-            if found_root:
-                top_cid = ancestor_cid
-                break
-            if ancestor_cid == root_cid:
-                found_root = True
-        resolved[parent_cid] = top_cid if top_cid in direct_dirs else None
-        progress(
-            {"text": "核对目录归属", "current": len(resolved), "total": len(parent_ids)}
-        )
+        current = parent_cid
+        while current in directories and directories[current]["pid"] != root_cid:
+            current = directories[current]["pid"]
+        resolved[parent_cid] = current if current in directories else None
+        progress({"text": "核对目录归属", "current": len(resolved), "total": len(parent_ids)})
     return resolved
 
 

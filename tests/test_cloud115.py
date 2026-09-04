@@ -990,3 +990,47 @@ def test_hls_unavailable_is_distinct_from_upstream_failure(payload) -> None:
                 await client.get_video_info("pc")
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("directories", [True, False])
+def test_subtree_slim_list_follows_has_next_page(directories):
+    calls = []
+
+    def handler(request):
+        page = int(request.url.params["page"])
+        calls.append(page)
+        assert request.url.path == ("/files/downfolders" if directories else "/files/downfiles")
+        assert request.url.params["per_page"] == "5000"
+        row = {"fid": str(page), "fn": "folder", "pid": "root"} if directories else {"pc": str(page), "fs": 0, "pid": "root"}
+        return httpx.Response(200, json={"state": True, "data": {
+            "list": [row], "count": 1, "has_next_page": page == 1,
+        }})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = Cloud115Client("UID=123_A1; CID=c; SEID=s", http_client=http_client, pace_webapi=False)
+            return [row async for row in client.iter_download_nodes("root-pc", directories=directories, progress=lambda _: None)]
+
+    assert len(asyncio.run(run())) == 2
+    assert calls == [1, 2]
+
+
+@pytest.mark.parametrize("failure", ["missing_pagination", "count_mismatch", "repeated_page"])
+def test_subtree_slim_list_rejects_incomplete_or_repeated_pages(failure):
+    def handler(request):
+        data = {"list": [{"fid": "1", "fn": "folder", "pid": "root"}], "count": 1, "has_next_page": False}
+        if failure == "missing_pagination":
+            del data["has_next_page"]
+        elif failure == "count_mismatch":
+            data["count"] = 2
+        else:
+            data["has_next_page"] = True
+        return httpx.Response(200, json={"state": True, "data": data})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = Cloud115Client("UID=123_A1; CID=c; SEID=s", http_client=http_client, pace_webapi=False)
+            return [row async for row in client.iter_download_nodes("root-pc", directories=True, progress=lambda _: None)]
+
+    with pytest.raises(cloud115.Cloud115Error):
+        asyncio.run(run())
