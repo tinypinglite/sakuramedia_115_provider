@@ -24,6 +24,18 @@ def video(parent, *, sha1=SHA1, size=100):
     )
 
 
+class Reporter:
+    task_run_id = 42
+
+    def __init__(self):
+        self.events = []
+        self.summary = {}
+
+    def progress_callback(self, payload):
+        self.events.append(payload)
+        self.summary.update(payload.get("summary_patch", {}))
+
+
 class TreeClient:
     def __init__(self):
         self.tree = {}
@@ -75,7 +87,9 @@ def client(monkeypatch):
     return client
 
 
-def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(client):
+def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(
+    client, log_messages
+):
     ids = ("imported", "copy", "unmatched", "active", "completed", "wrong-size")
     client.tree["root"] = tuple(directory(cid) for cid in ids)
     client.files["root"] = (
@@ -97,8 +111,24 @@ def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(c
         SimpleNamespace(save_dir_id="completed", status=2),
     )
 
-    cleanup.cleanup_imported_downloads(None, {"confirm": True})
+    reporter = Reporter()
+    result = cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
 
+    assert result["skipped_offline_directories"] == 2
+    assert result["skipped_unimported_video_directories"] == 1
+    assert result["skipped_unmatched_directories"] == 1
+    assert result["skipped_directories"] == 4
+    assert "result_text" not in result
+    assert result["elapsed_seconds"] >= 0
+    assert any(e["text"].endswith("核对目录归属：0/6") for e in reporter.events)
+    assert any(e["text"].endswith("核对目录归属：6/6") for e in reporter.events)
+    assert any(e["text"].endswith("删除目录：2/2") for e in reporter.events)
+    assert reporter.summary == result
+    assert any(
+        "已删除目录" in message and "task-imported" in message
+        for message in log_messages
+    )
+    assert any("reason=仍关联离线任务" in message for message in log_messages)
     assert client.deleted == [(["imported", "copy"], "root")]
 
 
@@ -141,7 +171,13 @@ def test_cleanup_preserves_counts_when_second_batch_fails(client, monkeypatch, h
     monkeypatch.setattr(client, "delete_files", fail_second_batch)
     monkeypatch.setattr(cleanup, "DELETE_BATCH_SIZE", 1)
 
-    result = handler(None, {"confirm": True})
+    reporter = Reporter()
+    if handler is cleanup.cleanup_imported_downloads:
+        with pytest.raises(cleanup.Cloud115Error, match="deleted_directories.*1"):
+            handler(reporter, {"confirm": True})
+        result = reporter.summary
+    else:
+        result = handler(reporter, {"confirm": True})
 
     assert client.deleted == [(["a"], "root")]
     assert result["deleted_directories"] == 1
@@ -163,3 +199,62 @@ def test_cleanup_requires_confirmation_before_accessing_data(
 
     with pytest.raises(ValueError):
         handler(None, params)
+
+
+def test_cleanup_reports_directory_stage_before_waiting_for_115(client, monkeypatch):
+    client.tree["root"] = (directory("a"),)
+    client.files["root"] = (video("nested"),)
+    reporter = Reporter()
+
+    async def fail_directory_info(cid):
+        assert reporter.events[-1]["text"].endswith("核对目录归属：0/1")
+        raise cleanup.Cloud115Error("115 unavailable")
+
+    monkeypatch.setattr(client, "directory_info", fail_directory_info)
+    with pytest.raises(cleanup.Cloud115Error, match="cleanup failed"):
+        cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
+    assert not client.deleted
+    assert reporter.summary["failed_libraries"] == 1
+
+
+def test_cleanup_throttles_progress_and_restores_stage_after_wait(
+    monkeypatch, log_messages
+):
+    now = [0.0]
+    monkeypatch.setattr(cleanup.time, "monotonic", lambda: now[0])
+    reporter = Reporter()
+    progress = cleanup._CleanupProgress(reporter)
+    progress({"text": "核对目录归属", "current": 0, "total": 100})
+    for value in range(1, 12):
+        now[0] = value
+        progress({"text": "核对目录归属", "current": value, "total": 100})
+    assert len(reporter.events) == 6
+    assert len(log_messages) == 2
+    progress({"wait_seconds": 23})
+    assert reporter.events[-1]["text"].endswith("请求间隔等待 23 秒")
+    assert reporter.events[-1]["current"] == 11
+    progress({"wait_seconds": 0})
+    assert reporter.events[-1]["text"] == "核对目录归属：11/100"
+    progress({"text": "读取目录", "current": 0, "total": 0})
+    assert reporter.events[-1]["total"] == 0
+
+
+def test_cleanup_continues_other_libraries_after_failure(client, monkeypatch):
+    valid = cleanup._load_media_libraries()[0]
+    invalid = SimpleNamespace(id=2, provider_config={})
+    monkeypatch.setattr(
+        cleanup,
+        "_load_imported_media_groups",
+        lambda: {
+            2: (invalid, {SHA1: {100}}),
+            1: (valid, {SHA1: {100}}),
+        },
+    )
+    client.tree["root"] = (directory("a"),)
+    client.files["root"] = (video("a"),)
+    reporter = Reporter()
+    with pytest.raises(cleanup.Cloud115Error, match="failed_libraries.*1"):
+        cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
+    assert client.deleted == [(["a"], "root")]
+    assert reporter.summary["deleted_directories"] == 1
+    assert reporter.summary["libraries"] == 2

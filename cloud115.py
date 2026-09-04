@@ -13,7 +13,7 @@ import random
 import re
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Protocol
@@ -175,7 +175,9 @@ class Cloud115Client:
         pace_webapi: bool = True,
         batch_pacing: bool = False,
         transfer_state: TransferState | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        self._progress_callback = progress_callback
         self._cookies = self._keep_essential(self.parse_cookies(cookies))
         uid = self._cookies.get("UID", "")
         match = self._UID_PATTERN.match(uid)
@@ -341,7 +343,11 @@ class Cloud115Client:
         if request_at > now:
             logger.debug("115 请求节流等待 account_uid={} wait_seconds={:.2f} batch={}",
                          self.user_id, request_at - now, self._batch_pacing)
+            if self._progress_callback is not None and request_at - now >= 10:
+                self._progress_callback({"wait_seconds": request_at - now})
             await asyncio.sleep(request_at - now)
+            if self._progress_callback is not None and request_at - now >= 10:
+                self._progress_callback({"wait_seconds": 0})
 
     async def _json(
         self,
@@ -517,6 +523,8 @@ class Cloud115Client:
                 },
             )
             entries, total = self._directory_page(payload, cid=cid, offset=offset)
+            if self._progress_callback is not None:
+                self._progress_callback({"text": "扫描下载文件", "current": offset + len(entries), "total": total})
             if not entries:
                 return
             for entry in entries:

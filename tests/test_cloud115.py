@@ -339,6 +339,7 @@ def test_upload_domains_share_the_minimum_request_interval(monkeypatch) -> None:
 
 
 def test_batch_webapi_pacing_waits_after_each_thirty_requests(monkeypatch) -> None:
+    progress_events = []
     intervals: list[tuple[float, float]] = []
     sleep_delays: list[float] = []
     now = [100.0]
@@ -360,6 +361,7 @@ def test_batch_webapi_pacing_waits_after_each_thirty_requests(monkeypatch) -> No
         client = Cloud115Client(
             "UID=987654321_A1_x; CID=c; SEID=s",
             batch_pacing=True,
+            progress_callback=progress_events.append,
         )
         try:
             for _ in range(31):
@@ -372,6 +374,8 @@ def test_batch_webapi_pacing_waits_after_each_thirty_requests(monkeypatch) -> No
     assert intervals.count((10.0, 30.0)) == 1
     assert sleep_delays[-1] == 17.0
     assert cloud115._WEBAPI_NEXT_REQUEST_AT["987654321"] == now[0] + 1.0
+
+    assert progress_events == [{"wait_seconds": 17.0}, {"wait_seconds": 0}]
 
 
 @pytest.mark.parametrize("status,host,body,error_type", [
@@ -399,6 +403,7 @@ def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) ->
     monkeypatch.setattr(cloud115, "_WEBAPI_NEXT_REQUEST_AT", {})
     monkeypatch.setattr(cloud115.random, "uniform", lambda _low, _high: 0.0)
     requests: list[httpx.Request] = []
+    progress_events = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -422,7 +427,9 @@ def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) ->
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
             client = Cloud115Client(
-                "UID=123456_A1_x; CID=c; SEID=s", http_client=http_client
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+                progress_callback=progress_events.append,
             )
             return [entry async for entry in client.iter_files_recursive("source")]
         finally:
@@ -432,6 +439,8 @@ def test_iter_files_recursive_uses_server_side_recursive_listing(monkeypatch) ->
 
     assert [entry.name for entry in entries] == ["A.mp4", "B.mp4"]
     assert len(requests) == 2
+
+    assert [(e["current"], e["total"]) for e in progress_events] == [(1, 2), (2, 2)]
 
 
 def test_directory_info_parses_ancestor_breadcrumbs(monkeypatch) -> None:
