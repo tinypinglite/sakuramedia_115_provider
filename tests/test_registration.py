@@ -10,7 +10,7 @@ from src.plugins.extensions.media_provider import validate_media_provider_extens
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
 
 
-def test_registration_declares_v4_provider_bundle(tmp_path: Path) -> None:
+def test_registration_declares_v5_provider_bundle(tmp_path: Path) -> None:
     manifest = json.loads((Path(__file__).parents[1] / "manifest.json").read_text(encoding="utf-8"))
     registration = register(
         PluginContext(plugin_id=PLUGIN_ID, settings={}, data_dir=tmp_path / "plugin-data")
@@ -20,9 +20,9 @@ def test_registration_declares_v4_provider_bundle(tmp_path: Path) -> None:
 
     assert manifest["plugin_id"] == PLUGIN_ID
     assert manifest["display_name"] == DISPLAY_NAME
-    assert manifest["host_api_version"] == 4
+    assert manifest["host_api_version"] == 5
     assert manifest["dependencies"] == []
-    assert registration.host_api_version == 4
+    assert registration.host_api_version == 5
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "cloud115"
     assert bundle.playback_deliveries == ("proxy", "redirect")

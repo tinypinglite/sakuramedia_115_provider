@@ -14,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from loguru import logger
+from starlette.responses import Response
+
 from src.plugins.provider_protocol import (
     BrowseEntry,
     BrowsePage,
@@ -24,26 +26,29 @@ from src.plugins.provider_protocol import (
     JsonObject,
     LibraryHandle,
     MediaHandle,
+    MediaTransferSource,
     PlaybackContext,
     ProviderOperationError,
     StagedMedia,
+    StagedMediaTransfer,
     ThumbnailArtifact,
     ThumbnailBackendUnavailable,
     ThumbnailGeneration,
     ThumbnailGenerationDeferred,
 )
-from starlette.responses import Response
 
 from .cloud115 import (
     Cloud115Client,
     Cloud115Entry,
     Cloud115VideoSegment,
+    TransferState,
     choose_hls_definition,
     find_or_create_subdir,
     run_sync,
 )
 from .exceptions import (
     Cloud115AuthError,
+    Cloud115DuplicateNameError,
     Cloud115Error,
     Cloud115NotFoundError,
     Cloud115RequestError,
@@ -59,6 +64,7 @@ DIR_REF_KIND = "cloud115_dir"
 ENTRY_REF_KIND = "cloud115_entry"
 MEDIA_REF_KIND = "cloud115_media"
 STAGE_RECEIPT_KIND = "cloud115_stage"
+TRANSFER_RECEIPT_KIND = "cloud115_transfer_stage"
 THUMBNAIL_INTERVAL_SECONDS = 10
 THUMBNAIL_HLS_MAX_WORKERS = 3
 THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL = 50
@@ -132,6 +138,8 @@ class Cloud115StorageProvider:
         self._media_root_cid = media_root
         self.data_dir = data_dir
         self._playback = Cloud115Playback(device_cookie=cookie)
+        self._transfer_state = TransferState()
+        self._transfer_directories: dict[str, dict[str, str]] = {}
 
     def browse(
         self, *, parent_ref: JsonObject | None, cursor: str | None, limit: int
@@ -464,6 +472,265 @@ class Cloud115StorageProvider:
     ) -> str | None:
         info = await client.get_video_info(entry.pickcode)
         return choose_hls_definition(info.definitions).resolution or None
+
+    def stage_transfer(
+        self,
+        *,
+        source: MediaTransferSource,
+        placement: ImportPlacement,
+        operation_key: str,
+    ) -> StagedMediaTransfer:
+        """Attempt only a 115 rapid upload from a path-free source session."""
+        try:
+            placement_parts = _safe_relative_parts(placement.relative_path)
+            operation_dir = _operation_directory(operation_key)
+            source_name = source.info.file_name
+            source_size = source.info.size_bytes
+            if (
+                source_name != placement_parts[-1]
+                or not isinstance(source_name, str)
+                or not source_name
+                or "/" in source_name
+                or "\\" in source_name
+                or not isinstance(source_size, int)
+                or source_size < 0
+            ):
+                raise ValueError("invalid transfer source metadata")
+        except (AttributeError, ValueError) as exc:
+            raise _error("stage_transfer", "invalid_config", "媒体传输参数无效") from exc
+
+        try:
+            return run_sync(
+                self._stage_transfer(
+                    source=source,
+                    source_name=source_name,
+                    source_size=source_size,
+                    placement_parts=placement_parts,
+                    operation_dir=operation_dir,
+                )
+            )
+        except Cloud115Error as exc:
+            raise _cloud_error("stage_transfer", exc) from None
+
+    async def _transfer_directory(
+        self, client: Cloud115Client, parent: str, name: str
+    ) -> str:
+        for attempt in range(2):
+            if parent not in self._transfer_directories:
+                entries = await client.list_directory(parent)
+                self._transfer_directories[parent] = {
+                    entry.name: entry.entry_id for entry in entries if entry.is_dir
+                }
+            directories = self._transfer_directories[parent]
+            if name in directories:
+                return directories[name]
+            try:
+                directories[name] = await client.mkdir(parent, name)
+                return directories[name]
+            except Cloud115DuplicateNameError:
+                self._transfer_directories.pop(parent, None)
+                if attempt:
+                    raise
+        raise AssertionError("unreachable directory lookup")
+
+    async def _stage_transfer(
+        self,
+        *,
+        source: MediaTransferSource,
+        source_name: str,
+        source_size: int,
+        placement_parts: tuple[str, ...],
+        operation_dir: str,
+    ) -> StagedMediaTransfer:
+        async with Cloud115Client(
+            self._device_cookie,
+            batch_pacing=True,
+            transfer_state=self._transfer_state,
+        ) as client:
+            # 不支持的 Cookie 在哈希和远端建目录之前拒绝。
+            client._rapid_upload_protocol()
+            # Hash before mkdir/init; only this successful mkdir owns the operation directory.
+            source_sha1 = await asyncio.to_thread(
+                client._hash_source, source, source_size
+            )
+            source.assert_unchanged()
+            parent = self._media_root_cid
+            for component in placement_parts[:-1]:
+                parent = await self._transfer_directory(client, parent, component)
+            operation_cid = await client.mkdir(parent, operation_dir)
+            target_entry = None
+            not_hit = False
+            try:
+                result = await client.rapid_upload(
+                    source,
+                    filename=source_name,
+                    size_bytes=source_size,
+                    parent_cid=operation_cid,
+                    file_sha1=source_sha1,
+                )
+                not_hit = result.status == "not_hit"
+                entry = result.entry
+                if not not_hit and (
+                    entry is None
+                    or entry.is_dir
+                    or entry.parent_id != operation_cid
+                    or entry.name != source_name
+                    or entry.size_bytes != source_size
+                    or not entry.sha1
+                    or entry.sha1.upper() != source_sha1.upper()
+                    or not entry.pickcode
+                    or not entry.entry_id
+                ):
+                    raise Cloud115RequestError("115 秒传结果校验失败")
+                target_entry = entry
+                if not not_hit:
+                    source.assert_unchanged()
+            except Exception:
+                try:
+                    await self._rollback_transfer_operation(
+                        client,
+                        operation_cid=operation_cid,
+                        target_entry=target_entry,
+                        allow_empty_directory=not_hit,
+                    )
+                except Exception:
+                    logger.warning("115 秒传补偿未完成，可能有残留副本")
+                raise
+            if not_hit:
+                await self._rollback_transfer_operation(
+                    client,
+                    operation_cid=operation_cid,
+                    target_entry=None,
+                    allow_empty_directory=True,
+                )
+                return StagedMediaTransfer(status="not_available")
+        return StagedMediaTransfer(
+            status="staged",
+            storage_ref=_media_ref(target_entry),
+            receipt={
+                "version": REF_VERSION,
+                "kind": TRANSFER_RECEIPT_KIND,
+                "target_fid": target_entry.entry_id,
+                "target_parent_cid": target_entry.parent_id,
+                "target_pickcode": target_entry.pickcode,
+                "target_name": target_entry.name,
+                "target_sha1": source_sha1,
+                "target_size_bytes": target_entry.size_bytes,
+                "operation_cid": operation_cid,
+            },
+            file_name=target_entry.name,
+            size_bytes=target_entry.size_bytes,
+        )
+
+    @staticmethod
+    async def _rollback_transfer_operation(
+        client: Cloud115Client,
+        *,
+        operation_cid: str,
+        target_entry: Cloud115Entry | None,
+        allow_empty_directory: bool,
+    ) -> None:
+        if target_entry is not None:
+            if target_entry.parent_id != operation_cid:
+                raise Cloud115RequestError("115 秒传暂存文件已离开操作目录，拒绝删除")
+            try:
+                current = await client.file_by_id(target_entry.entry_id)
+            except Cloud115NotFoundError:
+                current = None
+            if current is not None:
+                if not Cloud115StorageProvider._same_transfer_entry(
+                    current, target_entry
+                ):
+                    raise Cloud115RequestError("115 秒传暂存文件身份已变化，拒绝删除")
+                await client.delete_files(
+                    [current.entry_id], parent_cid=current.parent_id
+                )
+        elif not allow_empty_directory:
+            return
+
+        try:
+            remaining = await client.list_directory(operation_cid)
+        except Cloud115NotFoundError:
+            return
+        if remaining:
+            raise Cloud115RequestError("115 秒传操作目录非空，拒绝删除目录")
+        try:
+            await client.delete_files([operation_cid])
+        except Cloud115NotFoundError:
+            pass
+
+    @staticmethod
+    def _same_transfer_entry(left: Cloud115Entry, right: Cloud115Entry) -> bool:
+        return (
+            not left.is_dir
+            and left.entry_id == right.entry_id
+            and left.parent_id == right.parent_id
+            and left.name == right.name
+            and left.size_bytes == right.size_bytes
+            and bool(left.sha1)
+            and bool(right.sha1)
+            and left.sha1.upper() == right.sha1.upper()
+            and bool(left.pickcode)
+            and left.pickcode == right.pickcode
+        )
+
+    @staticmethod
+    def _expected_transfer(receipt: JsonObject, operation: str) -> Cloud115Entry:
+        transfer = _transfer_receipt(receipt, operation=operation)
+        return Cloud115Entry(
+            entry_id=transfer["target_fid"],
+            parent_id=transfer["operation_cid"],
+            name=transfer["target_name"],
+            is_dir=False,
+            size_bytes=transfer["target_size_bytes"],
+            sha1=transfer["target_sha1"],
+            pickcode=transfer["target_pickcode"],
+            modified_at=0,
+            is_video=False,
+        )
+
+    def finalize_transfer(self, *, receipt: JsonObject) -> None:
+        expected = self._expected_transfer(receipt, "finalize_transfer")
+
+        async def verify():
+            async with Cloud115Client(
+                self._device_cookie,
+                batch_pacing=True,
+                transfer_state=self._transfer_state,
+            ) as client:
+                current = await client.file_by_id(expected.entry_id)
+                if not self._same_transfer_entry(current, expected):
+                    raise Cloud115RequestError("115 目标身份不匹配")
+                async for entry in client.iter_files_recursive(expected.parent_id):
+                    if self._same_transfer_entry(entry, expected):
+                        return
+                raise Cloud115RequestError("115 目标尚未在目录中确认")
+
+        try:
+            run_sync(verify())
+        except Cloud115Error as exc:
+            raise _cloud_error("finalize_transfer", exc) from None
+
+    def abort_transfer(self, *, receipt: JsonObject) -> None:
+        expected = self._expected_transfer(receipt, "abort_transfer")
+
+        async def abort():
+            async with Cloud115Client(
+                self._device_cookie,
+                batch_pacing=True,
+                transfer_state=self._transfer_state,
+            ) as client:
+                await self._rollback_transfer_operation(
+                    client,
+                    operation_cid=expected.parent_id,
+                    target_entry=expected,
+                    allow_empty_directory=True,
+                )
+
+        try:
+            run_sync(abort())
+        except Cloud115Error as exc:
+            raise _cloud_error("abort_transfer", exc) from None
 
     def finalize_import(self, *, receipt: JsonObject) -> None:
         _stage_receipt(receipt, operation="finalize_import")
@@ -1022,6 +1289,37 @@ def _stage_receipt(receipt: object, *, operation: str) -> dict[str, str]:
     if result["source_disposition"] not in {"keep", "delete_after_commit"}:
         raise _error(operation, "source_not_found", "115 导入回执无效")
     return result  # type: ignore[return-value]
+
+
+def _transfer_receipt(receipt: object, *, operation: str) -> dict[str, Any]:
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("version") != REF_VERSION
+        or receipt.get("kind") != TRANSFER_RECEIPT_KIND
+    ):
+        raise _error(operation, "source_not_found", "115 传输回执无效")
+    fields = (
+        "target_fid",
+        "target_parent_cid",
+        "target_pickcode",
+        "target_name",
+        "target_sha1",
+        "operation_cid",
+    )
+    values = {field: receipt.get(field) for field in fields}
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise _error(operation, "source_not_found", "115 传输回执无效")
+    size_bytes = receipt.get("target_size_bytes")
+    if (
+        not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 0
+    ):
+        raise _error(operation, "source_not_found", "115 传输回执无效")
+    values["target_size_bytes"] = size_bytes
+    if values["target_parent_cid"] != values["operation_cid"]:
+        raise _error(operation, "source_not_found", "115 传输回执无效")
+    return values
 
 
 def _find_staged_entry(

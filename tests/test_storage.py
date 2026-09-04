@@ -4,35 +4,38 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import pytest
-from src.plugins.provider_protocol import (
-    ImportFile,
-    ImportPlacement,
-    LibraryHandle,
-    MediaHandle,
-    ProviderOperationError,
-    ThumbnailArtifact,
-)
-
 from sakuramedia_115_provider import storage
 from sakuramedia_115_provider.cloud115 import (
     Cloud115Client,
     Cloud115DirectoryInfo,
     Cloud115DirectUrl,
     Cloud115Entry,
+    Cloud115RapidUploadResult,
     Cloud115VideoDefinition,
     Cloud115VideoInfo,
     Cloud115VideoSegment,
 )
 from sakuramedia_115_provider.exceptions import (
+    Cloud115NotFoundError,
     Cloud115RiskControlError,
     Cloud115VideoUnavailableError,
+)
+
+from src.plugins.provider_protocol import (
+    ImportFile,
+    ImportPlacement,
+    LibraryHandle,
+    MediaHandle,
+    MediaTransferSourceInfo,
+    ProviderOperationError,
+    ThumbnailArtifact,
 )
 
 
 class FakeClient:
     entries: ClassVar[dict[str, list[Cloud115Entry]]] = {}
 
-    def __init__(self, _cookie: str) -> None:
+    def __init__(self, _cookie: str, **_kwargs) -> None:
         pass
 
     async def __aenter__(self):
@@ -104,6 +107,99 @@ class ScanClient:
         return type(self).directory_infos[cid]
 
 
+class TransferClient:
+    delete_calls: ClassVar[list[tuple[tuple[str, ...], str | None]]] = []
+    rename_calls: ClassVar[list[tuple[str, str]]] = []
+    rapid_status: ClassVar[str] = "success"
+
+    def __init__(self, _cookie: str, **_kwargs) -> None:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+    @staticmethod
+    def _rapid_upload_protocol():
+        return "web"
+
+    @staticmethod
+    def _hash_source(_source, _size_bytes: int) -> str:
+        return "A" * 40
+
+    async def list_directory(self, _cid: str):
+        return ()
+
+    async def mkdir(self, parent_cid, name):
+        return "folder-cid" if name == "folder" else "op-cid"
+
+    async def iter_files_recursive(self, cid):
+        yield await self.file_by_id("fid")
+
+    async def rapid_upload(
+        self, _source, *, filename: str, size_bytes: int, parent_cid: str, file_sha1: str
+    ):
+        assert filename == "source.mp4"
+        assert size_bytes == 99
+        assert parent_cid == "op-cid"
+        assert file_sha1 == "A" * 40
+        if type(self).rapid_status == "not_hit":
+            return Cloud115RapidUploadResult("not_hit", "A" * 40)
+        entry = Cloud115Entry(
+            "fid", "op-cid", "source.mp4", False, 99, "A" * 40, "pick", 0, True
+        )
+        return Cloud115RapidUploadResult("success", "A" * 40, entry)
+
+    async def rename_file(self, file_id: str, name: str) -> None:
+        type(self).rename_calls.append((file_id, name))
+
+    async def file_by_id(self, file_id: str):
+        return Cloud115Entry(
+            file_id, "op-cid", "source.mp4", False, 99, "A" * 40, "pick", 0, True
+        )
+
+    async def delete_files(self, file_ids, *, parent_cid: str | None = None) -> None:
+        type(self).delete_calls.append((tuple(file_ids), parent_cid))
+
+
+class TransferSource:
+    info = MediaTransferSourceInfo(file_name="source.mp4", size_bytes=99)
+
+    def open_reader(self):
+        raise AssertionError("the fake rapid client must not read this source")
+
+    def assert_unchanged(self) -> None:
+        return None
+
+
+class MovedReceiptClient(TransferClient):
+    async def file_by_id(self, file_id: str):
+        return Cloud115Entry(
+            file_id, "other-cid", "target.mp4", False, 99, "A" * 40, "pick", 0, True
+        )
+
+
+class RenamedReceiptClient(TransferClient):
+    async def file_by_id(self, file_id: str):
+        return Cloud115Entry(
+            file_id, "op-cid", "renamed.mp4", False, 99, "A" * 40, "pick", 0, True
+        )
+
+
+class MissingReceiptFileClient(TransferClient):
+    async def file_by_id(self, _file_id: str):
+        raise Cloud115NotFoundError("missing")
+
+    async def list_directory(self, _cid: str):
+        return (
+            Cloud115Entry(
+                "unknown", "op-cid", "unknown.mp4", False, 1, "B" * 40, "other", 0, True
+            ),
+        )
+
+
 def _scan_provider(tmp_path) -> storage.Cloud115StorageProvider:
     return storage.Cloud115StorageProvider(
         library=LibraryHandle(
@@ -114,6 +210,132 @@ def _scan_provider(tmp_path) -> storage.Cloud115StorageProvider:
         ),
         data_dir=tmp_path,
     )
+
+
+def test_stage_transfer_uses_operation_directory_and_abort_deletes_file_first(
+    monkeypatch, tmp_path
+) -> None:
+    TransferClient.delete_calls = []
+    TransferClient.rename_calls = []
+    TransferClient.rapid_status = "success"
+
+    async def find_dir(_client, *, parent_cid: str, name: str) -> str:
+        if name == "folder":
+            assert parent_cid == "media"
+            return "folder-cid"
+        assert parent_cid == "folder-cid"
+        assert name.startswith("op-")
+        return "op-cid"
+
+    monkeypatch.setattr(storage, "Cloud115Client", TransferClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
+    provider = _scan_provider(tmp_path)
+    staged = provider.stage_transfer(
+        source=TransferSource(),
+        placement=ImportPlacement(relative_path="folder/source.mp4"),
+        operation_key="task:1:item:2",
+    )
+
+    assert staged.status == "staged"
+    assert staged.storage_ref is not None and staged.storage_ref["fid"] == "fid"
+    assert staged.file_name == "source.mp4"
+    assert TransferClient.rename_calls == []
+    assert staged.receipt is not None
+    provider.finalize_transfer(receipt=staged.receipt)
+    provider.abort_transfer(receipt=staged.receipt)
+    assert TransferClient.delete_calls == [(("fid",), "op-cid"), (("op-cid",), None)]
+
+
+def test_stage_transfer_not_hit_removes_its_empty_operation_directory(monkeypatch, tmp_path) -> None:
+    TransferClient.delete_calls = []
+    TransferClient.rename_calls = []
+    TransferClient.rapid_status = "not_hit"
+
+    async def find_dir(_client, *, parent_cid: str, name: str) -> str:
+        return "folder-cid" if name == "folder" else "op-cid"
+
+    monkeypatch.setattr(storage, "Cloud115Client", TransferClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
+    staged = _scan_provider(tmp_path).stage_transfer(
+        source=TransferSource(),
+        placement=ImportPlacement(relative_path="folder/source.mp4"),
+        operation_key="task:1:item:3",
+    )
+
+    assert staged.status == "not_available"
+    assert TransferClient.delete_calls == [(("op-cid",), None)]
+
+
+def test_stage_transfer_never_adopts_existing_operation_directory(monkeypatch, tmp_path):
+    from sakuramedia_115_provider.exceptions import Cloud115DuplicateNameError
+
+    class DuplicateOperationClient(TransferClient):
+        async def mkdir(self, parent_cid, name):
+            if name.startswith("op-"):
+                raise Cloud115DuplicateNameError("duplicate")
+            return "folder-cid"
+
+        async def rapid_upload(self, *_args, **_kwargs):
+            raise AssertionError("must not adopt an old operation")
+
+    DuplicateOperationClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", DuplicateOperationClient)
+    with pytest.raises(ProviderOperationError):
+        _scan_provider(tmp_path).stage_transfer(
+            source=TransferSource(), placement=ImportPlacement(relative_path="folder/source.mp4"), operation_key="task:duplicate",
+        )
+    assert DuplicateOperationClient.delete_calls == []
+
+
+def _valid_transfer_receipt() -> dict[str, object]:
+    return {
+        "version": 1,
+        "kind": storage.TRANSFER_RECEIPT_KIND,
+        "target_fid": "fid",
+        "target_parent_cid": "op-cid",
+        "target_pickcode": "pick",
+        "target_name": "source.mp4",
+        "target_sha1": "A" * 40,
+        "target_size_bytes": 99,
+        "operation_cid": "op-cid",
+    }
+
+
+def test_abort_transfer_refuses_to_delete_a_moved_or_replaced_file(
+    monkeypatch, tmp_path
+) -> None:
+    MovedReceiptClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", MovedReceiptClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
+
+    assert error.value.code == "unavailable"
+    assert MovedReceiptClient.delete_calls == []
+
+
+def test_abort_transfer_refuses_to_delete_a_renamed_file(monkeypatch, tmp_path) -> None:
+    RenamedReceiptClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", RenamedReceiptClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
+
+    assert error.value.code == "unavailable"
+    assert RenamedReceiptClient.delete_calls == []
+
+
+def test_abort_transfer_preserves_nonempty_directory_when_receipt_file_is_missing(
+    monkeypatch, tmp_path
+) -> None:
+    MissingReceiptFileClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", MissingReceiptFileClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
+
+    assert error.value.code == "unavailable"
+    assert MissingReceiptFileClient.delete_calls == []
 
 
 def test_scan_import_source_skips_historical_empty_directories(monkeypatch, tmp_path) -> None:
@@ -550,7 +772,7 @@ def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
 class HashClient:
     file_size_bytes = 0
 
-    def __init__(self, _cookie: str) -> None:
+    def __init__(self, _cookie: str, **_kwargs) -> None:
         pass
 
     async def __aenter__(self):
@@ -789,3 +1011,147 @@ def test_generate_thumbnails_logs_start_progress_and_completion(monkeypatch, tmp
     assert log_records[0][1] == (1, 3, 3)
     assert log_records[1][1][:-1] == (1, 3, 3, 3, 3)
     assert log_records[2][1][:-1] == (1, 3, 3, 3)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("entry_id", "other"),
+        ("parent_id", "other"),
+        ("name", "other.mp4"),
+        ("size_bytes", 100),
+        ("sha1", "B" * 40),
+        ("pickcode", "other"),
+        ("is_dir", True),
+    ],
+)
+def test_finalize_transfer_rejects_changed_target(monkeypatch, tmp_path, field, value):
+    from dataclasses import replace
+
+    class ChangedClient(TransferClient):
+        async def file_by_id(self, file_id):
+            return replace(await super().file_by_id(file_id), **{field: value})
+
+    monkeypatch.setattr(storage, "Cloud115Client", ChangedClient)
+    with pytest.raises(ProviderOperationError):
+        _scan_provider(tmp_path).finalize_transfer(receipt=_valid_transfer_receipt())
+
+
+def test_finalize_transfer_requires_directory_visibility(monkeypatch, tmp_path):
+    class UnindexedClient(TransferClient):
+        async def iter_files_recursive(self, cid):
+            for entry in ():
+                yield entry
+
+    monkeypatch.setattr(storage, "Cloud115Client", UnindexedClient)
+    with pytest.raises(ProviderOperationError):
+        _scan_provider(tmp_path).finalize_transfer(receipt=_valid_transfer_receipt())
+
+
+def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path):
+    from sakuramedia_115_provider.exceptions import Cloud115RequestError
+
+    class UnknownClient(TransferClient):
+        async def rapid_upload(self, *_args, **_kwargs):
+            raise Cloud115RequestError("timeout")
+
+        async def list_directory(self, cid):
+            assert cid != "op-cid", "must not search an unknown upload"
+            return ()
+
+    UnknownClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", UnknownClient)
+    with pytest.raises(ProviderOperationError):
+        _scan_provider(tmp_path).stage_transfer(
+            source=TransferSource(),
+            placement=ImportPlacement(relative_path="folder/source.mp4"),
+            operation_key="task:unknown",
+        )
+    assert UnknownClient.delete_calls == []
+
+
+def test_transfer_batch_reuses_parent_inventory(monkeypatch, tmp_path):
+    calls = []
+
+    class CachedClient(TransferClient):
+        async def list_directory(self, cid):
+            calls.append(cid)
+            return ()
+
+    CachedClient.rapid_status = "success"
+    monkeypatch.setattr(storage, "Cloud115Client", CachedClient)
+    provider = _scan_provider(tmp_path)
+    for i in range(2):
+        provider.stage_transfer(
+            source=TransferSource(),
+            placement=ImportPlacement(relative_path=f"folder/movie-{i}/source.mp4"),
+            operation_key=f"task:{i}",
+        )
+    assert calls.count("media") == 1
+    assert calls.count("folder-cid") == 1
+
+
+def test_invalid_upload_cookie_is_rejected_before_hash_or_directory_requests(
+    monkeypatch, tmp_path
+):
+    from sakuramedia_115_provider.cloud115 import Cloud115Client
+
+    class RejectUnexpectedClient(Cloud115Client):
+        @staticmethod
+        def _hash_source(source, size):
+            pytest.fail("unsupported upload cookie must not read the source")
+
+        async def _request(self, *args, **kwargs):
+            pytest.fail("unsupported upload cookie must not send requests")
+
+    monkeypatch.setattr(storage, "Cloud115Client", RejectUnexpectedClient)
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "UID=123_A1_x; CID=c; SEID=s", "media_root_cid": "media"},
+            "123",
+        ),
+        data_dir=tmp_path,
+    )
+    with pytest.raises(ProviderOperationError) as error:
+        provider.stage_transfer(
+            source=TransferSource(),
+            placement=ImportPlacement(relative_path="folder/source.mp4"),
+            operation_key="task:bad-cookie",
+        )
+    assert error.value.code == "authentication_failed"
+
+
+@pytest.mark.parametrize("response_data", [None, {"count": 1, "data": []}])
+def test_abort_cannot_delete_an_operation_using_an_invalid_empty_listing(
+    monkeypatch, tmp_path, response_data
+):
+    import httpx
+    from sakuramedia_115_provider.cloud115 import Cloud115Client
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/files/get_info":
+            return httpx.Response(200, json={"state": True, "data": []})
+        assert request.url.path == "/files"
+        return httpx.Response(
+            200, json={"state": True, "cid": "op-cid", **(response_data or {})}
+        )
+
+    class Client(Cloud115Client):
+        def __init__(self, cookie, **kwargs):
+            super().__init__(
+                "UID=123_R2_x; CID=c; SEID=s",
+                pace_webapi=False,
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+                **kwargs,
+            )
+            self._owns_client = True
+
+    monkeypatch.setattr(storage, "Cloud115Client", Client)
+    with pytest.raises(ProviderOperationError):
+        _scan_provider(tmp_path).abort_transfer(receipt=_valid_transfer_receipt())
+    assert all(request.method == "GET" for request in requests)
