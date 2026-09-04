@@ -95,7 +95,7 @@ class Cloud115MediaProviderBundle:
     provider_key = "cloud115"
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
-    playback_deliveries = ("proxy", "redirect")
+    playback_deliveries = ("redirect", "proxy")
     merged_playback_format = "hls"
 
     def __init__(self, *, data_dir: Path) -> None:

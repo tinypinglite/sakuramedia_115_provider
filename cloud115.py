@@ -912,7 +912,7 @@ class Cloud115Client:
             raise Cloud115VideoUnavailableError("115 视频转码尚未就绪")
         master_url = payload.get("video_url")
         if not isinstance(master_url, str) or not master_url:
-            raise Cloud115NotFoundError("115 未提供 HLS 播放列表")
+            raise Cloud115VideoUnavailableError("115 未提供 HLS 播放列表")
         text = await self._text(master_url)
         definitions: list[Cloud115VideoDefinition] = []
         attributes: dict[str, str] | None = None

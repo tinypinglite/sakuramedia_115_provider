@@ -28,6 +28,7 @@ from sakuramedia_115_provider.exceptions import (
     Cloud115OfflineTaskExistsError,
     Cloud115RequestError,
     Cloud115RiskControlError,
+    Cloud115VideoUnavailableError,
 )
 
 
@@ -1026,5 +1027,21 @@ def test_offline_duplicate_matches_live_nested_errtype_response():
             )
             with pytest.raises(Cloud115OfflineTaskExistsError):
                 await client.add_offline_url("magnet:?xt=urn:btih:" + "a" * 40, save_dir_id="test")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload", [
+    {"state": True, "file_status": 0},
+    {"state": True, "file_status": 1},
+])
+def test_hls_unavailable_is_distinct_from_upstream_failure(payload) -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+        ) as http_client:
+            client = Cloud115Client("UID=123456_A1_x; CID=c; SEID=s", http_client=http_client)
+            with pytest.raises(Cloud115VideoUnavailableError):
+                await client.get_video_info("pc")
 
     asyncio.run(run())

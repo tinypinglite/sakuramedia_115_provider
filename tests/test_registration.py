@@ -25,7 +25,7 @@ def test_registration_declares_v5_provider_bundle(tmp_path: Path) -> None:
     assert registration.host_api_version == 5
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "cloud115"
-    assert bundle.playback_deliveries == ("proxy", "redirect")
+    assert bundle.playback_deliveries == ("redirect", "proxy")
     assert [field.key for field in bundle.library_config_fields] == [
         "web_cookie",
         "media_root_path",

@@ -36,6 +36,7 @@ from .exceptions import (
     Cloud115Error,
     Cloud115NotFoundError,
     Cloud115RequestError,
+    Cloud115VideoUnavailableError,
 )
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
@@ -264,9 +265,19 @@ class Cloud115Playback:
         path = context.resource_path or ""
         if path:
             return await self._hls_segment(media=media, context=context, pickcode=pickcode)
-        if context.delivery == "redirect":
-            return await self._redirect(media=media, pickcode=pickcode, context=context)
-        return await self._proxy_root(media=media, pickcode=pickcode, context=context)
+        try:
+            if context.delivery == "redirect":
+                async with Cloud115Client(self._device_cookie) as client:
+                    info = await client.get_video_info(pickcode)
+                definition = choose_hls_definition(info.definitions)
+                return RedirectResponse(definition.playlist_url, status_code=302)
+            return await self._proxy_root(media=media, pickcode=pickcode, context=context)
+        except Cloud115VideoUnavailableError:
+            if context.delivery == "redirect":
+                return await self._redirect(media=media, pickcode=pickcode, context=context)
+            return await self._direct_relay(media=media, pickcode=pickcode, context=context)
+        except Cloud115Error as exc:
+            raise _cloud_error("playback", exc) from exc
 
     async def handle_merged(
         self,
@@ -340,12 +351,7 @@ class Cloud115Playback:
     async def _proxy_root(
         self, *, media: MediaHandle, pickcode: str, context: PlaybackContext
     ) -> Response:
-        try:
-            hls = await self._resolve_hls(media=media, pickcode=pickcode)
-        except Cloud115Error:
-            # HLS is an optimization.  A direct Range relay remains usable for
-            # non-transcoded and non-member files, so it is the deliberate fallback.
-            return await self._direct_relay(media=media, pickcode=pickcode, context=context)
+        hls = await self._resolve_hls(media=media, pickcode=pickcode)
         return PlainTextResponse(
             self._render_hls_playlist(hls, context),
             media_type="application/vnd.apple.mpegurl",

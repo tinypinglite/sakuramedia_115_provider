@@ -13,7 +13,12 @@ from sakuramedia_115_provider.cloud115 import (
     Cloud115VideoInfo,
     Cloud115VideoSegment,
 )
-from sakuramedia_115_provider.exceptions import Cloud115RequestError
+from sakuramedia_115_provider.exceptions import (
+    Cloud115AuthError,
+    Cloud115RequestError,
+    Cloud115RiskControlError,
+    Cloud115VideoUnavailableError,
+)
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -39,7 +44,7 @@ class FakeClient:
     async def get_video_info(self, pickcode: str) -> Cloud115VideoInfo:
         type(self).video_info_pickcodes.append(pickcode)
         if type(self).fail_hls:
-            raise Cloud115RequestError("no hls")
+            raise Cloud115VideoUnavailableError("no hls")
         return Cloud115VideoInfo(
             definitions=(
                 Cloud115VideoDefinition(100, "640x360", "low", "https://hls/low.m3u8"),
@@ -221,7 +226,7 @@ def test_hls_relay_ignores_range_and_rejects_partial_segments(monkeypatch) -> No
 
 
 def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
-    FakeClient.fail_hls = False
+    FakeClient.fail_hls = True
     FakeClient.download_user_agents.clear()
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
     response = asyncio.run(playback.Cloud115Playback(device_cookie="redirect-cookie").handle(
@@ -234,7 +239,7 @@ def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
 
 
 def test_redirect_reuses_cached_direct_url(monkeypatch) -> None:
-    FakeClient.fail_hls = False
+    FakeClient.fail_hls = True
     FakeClient.download_user_agents.clear()
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
     player = playback.Cloud115Playback(device_cookie="redirect-cache-cookie")
@@ -351,3 +356,32 @@ def test_merged_hls_reuses_layout_for_repeated_playlists(monkeypatch) -> None:
 
     assert first.body == second.body
     assert FakeClient.video_info_pickcodes == ["pc", "pc"]
+
+
+@pytest.mark.parametrize("range_header", [None, "bytes=0-"])
+def test_redirect_prefers_upstream_hls_playlist(monkeypatch, range_header):
+    monkeypatch.setattr(FakeClient, "fail_hls", False)
+    monkeypatch.setattr(FakeClient, "download_user_agents", [])
+    monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
+    response = asyncio.run(playback.Cloud115Playback(device_cookie="hls-cookie").handle(
+        media=_media(90), context=_context(delivery="redirect", range_header=range_header)
+    ))
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://hls/low.m3u8"
+    assert FakeClient.download_user_agents == []
+
+
+@pytest.mark.parametrize("delivery", ["redirect", "proxy"])
+@pytest.mark.parametrize("error", [Cloud115AuthError, Cloud115RequestError, Cloud115RiskControlError])
+def test_hls_errors_do_not_fall_back_to_original(monkeypatch, delivery, error):
+    class FailedClient(FakeClient):
+        async def get_video_info(self, pickcode):
+            raise error("test HLS error")
+
+    monkeypatch.setattr(FakeClient, "download_user_agents", [])
+    monkeypatch.setattr(playback, "Cloud115Client", FailedClient)
+    with pytest.raises(playback.ProviderOperationError):
+        asyncio.run(playback.Cloud115Playback(device_cookie="error-cookie").handle(
+            media=_media(91), context=_context(delivery=delivery)
+        ))
+    assert FakeClient.download_user_agents == []
