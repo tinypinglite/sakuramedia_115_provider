@@ -12,7 +12,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
 from .cloud115 import Cloud115Client, run_sync
-from .exceptions import Cloud115Error
+from .exceptions import Cloud115Error, safe_error_message
 from .offline import _INFO_HASH_DIR_RE
 
 DELETE_BATCH_SIZE = 1000
@@ -81,8 +81,10 @@ _DOWNLOAD_COUNTS = (
 
 
 class _CleanupProgress:
-    def __init__(self, reporter):
+    def __init__(self, reporter, *, label="115 下载清理"):
         self.reporter = reporter
+        self.label = label
+        self.detail = ""
         self.library = ""
         self.stage = ""
         self.current = self.total = 0
@@ -96,16 +98,20 @@ class _CleanupProgress:
         force = (
             stage != self.stage or (total > 0 and current == total) or wait is not None
         )
+        self.detail = payload.get("detail", self.detail if stage == self.stage else "")
         self.stage, self.current, self.total = stage, current, total
         text = f"{self.library}{stage}"
         if total > 0:
             text += f"：{current}/{total}"
+        if self.detail:
+            text += f" · {self.detail}"
         if wait is not None and wait > 0:
             text += f" · 请求间隔等待 {wait:.0f} 秒"
         now = time.monotonic()
         if force or now - self.last_log >= 10:
             logger.info(
-                "115 下载清理 task_run_id={} {}",
+                "{} task_run_id={} {}",
+                self.label,
                 getattr(self.reporter, "task_run_id", None),
                 text,
             )
@@ -327,15 +333,21 @@ def cleanup_empty_media_dirs(
 
 
 async def _cleanup_empty_media_dirs(*, reporter: Any | None) -> dict[str, int]:
+    started = time.monotonic()
+    progress = _CleanupProgress(reporter, label="115 空目录清理")
+    progress({"text": "读取媒体库"})
     libraries = _load_media_libraries()
     stats = {
         "libraries": len(libraries),
         "scanned_directories": 0,
         "candidate_directories": 0,
         "deleted_directories": 0,
+        "skipped_directories": 0,
         "failed_libraries": 0,
     }
-    for library in libraries:
+    for index, library in enumerate(libraries, 1):
+        progress.library = f"媒体库 {index}/{len(libraries)}（ID {library.id}）· "
+        progress({"text": "准备扫描", "current": 0, "total": 0})
         try:
             cookie, root_cid = _library_config(
                 library,
@@ -343,39 +355,54 @@ async def _cleanup_empty_media_dirs(*, reporter: Any | None) -> dict[str, int]:
                 root_key="media_root_cid",
             )
             async with Cloud115Client(cookie, batch_pacing=True) as client:
-                deletions, scanned = await _find_empty_directories(client, root_cid)
+                deletions, scanned = await _find_empty_directories(client, root_cid, progress)
                 stats["scanned_directories"] += scanned
-                stats["candidate_directories"] += sum(
-                    len(ids) for ids in deletions.values()
-                )
+                total = sum(len(ids) for ids in deletions.values())
+                stats["candidate_directories"] += total
+                logger.info("115 空目录扫描完成 library_id={} root_cid={} scanned={} candidates={}",
+                            library.id, root_cid, scanned, total)
+                processed = 0
+                progress({"text": "复核清理", "current": 0, "total": total,
+                          "detail": "没有空目录需要清理" if not total else ""})
                 for parent_cid in sorted(deletions):
-                    for batch in _chunks(
-                        sorted(deletions[parent_cid]), DELETE_BATCH_SIZE
-                    ):
+                    for batch in _chunks(sorted(deletions[parent_cid]), DELETE_BATCH_SIZE):
                         # 整棵子树复核无文件后才删除，避免沿用扫描阶段的判空结果。
                         empty = []
                         for cid in batch:
+                            progress({"detail": f"正在复核目录 {cid}"})
                             async for _entry in client.iter_files_recursive(cid):
+                                stats["skipped_directories"] += 1
+                                logger.info("115 空目录清理保留目录 library_id={} cid={} reason=复核发现文件",
+                                            library.id, cid)
                                 break
                             else:
                                 empty.append(cid)
                         if empty:
+                            progress({"detail": f"正在删除 {len(empty)} 个目录，父目录 {parent_cid}"})
                             await client.delete_files(empty, parent_cid=parent_cid)
                             stats["deleted_directories"] += len(empty)
+                            for cid in empty:
+                                logger.info("115 空目录清理已删除目录 library_id={} parent_cid={} cid={}",
+                                            library.id, parent_cid, cid)
+                        processed += len(batch)
+                        progress({"current": processed, "detail": ""})
         except (Cloud115Error, OSError, TypeError, ValueError) as exc:
             stats["failed_libraries"] += 1
-            logger.warning(
-                "115 empty-media-directory cleanup failed library_id={} error={}",
-                library.id,
-                exc,
-            )
-        _emit_progress(reporter, stats, "清理 115 媒体目录中的空目录")
+            logger.warning("115 空目录清理失败 library_id={} stage={} detail={} error_type={} reason={}",
+                           library.id, progress.stage, progress.detail, type(exc).__name__, safe_error_message(exc))
+        if reporter is not None:
+            reporter.progress_callback({"summary_patch": dict(stats)})
+    stats["elapsed_seconds"] = round(time.monotonic() - started)
+    _emit_progress(reporter, stats,
+                   f"空目录清理结束：扫描 {stats['scanned_directories']} 个目录，"
+                   f"删除 {stats['deleted_directories']} 个，保留 {stats['skipped_directories']} 个，"
+                   f"失败媒体库 {stats['failed_libraries']} 个")
     logger.info("115 empty-media-directory cleanup finished stats={}", stats)
     return stats
 
 
 async def _find_empty_directories(
-    client: Cloud115Client, root_cid: str
+    client: Cloud115Client, root_cid: str, progress: _CleanupProgress
 ) -> tuple[dict[str, list[str]], int]:
     deletions: dict[str, list[str]] = defaultdict(list)
     visited: set[str] = set()
@@ -384,6 +411,8 @@ async def _find_empty_directories(
         if cid in visited:
             raise Cloud115Error("115 目录树存在循环")
         visited.add(cid)
+        progress({"text": "扫描空目录", "current": len(visited) - 1, "total": 0,
+                  "detail": f"已扫描 {len(visited) - 1} 个目录，当前目录 {cid}"})
         entries = await client.list_directory(cid)
         has_file = False
         has_non_empty_child = False

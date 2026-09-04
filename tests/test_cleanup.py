@@ -132,7 +132,7 @@ def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(
     assert client.deleted == [(["imported", "copy"], "root")]
 
 
-def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(client):
+def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(client, log_messages):
     client.tree = {
         "root": (
             video("root"),
@@ -150,9 +150,17 @@ def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(clien
     # 初次扫描为空的子树，在删除前复核时出现了深层文件。
     client.files = {"outer": (), "changed": (video("changed-inner"),), "empty": ()}
 
-    cleanup.cleanup_empty_media_dirs(None, {"confirm": True})
+    reporter = Reporter()
+    result = cleanup.cleanup_empty_media_dirs(reporter, {"confirm": True})
 
     assert client.deleted == [(["empty"], "full"), (["outer"], "root")]
+    assert result["scanned_directories"] == 7
+    assert result["skipped_directories"] == 1
+    assert reporter.summary == result
+    assert any("当前目录 root" in event.get("text", "") for event in reporter.events)
+    assert any(event.get("current") == event.get("total") == 3 for event in reporter.events)
+    assert any("保留目录" in message and "cid=changed" in message for message in log_messages)
+    assert any("已删除目录" in message and "cid=outer" in message for message in log_messages)
 
 
 @pytest.mark.parametrize(
