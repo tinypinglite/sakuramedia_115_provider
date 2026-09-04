@@ -41,6 +41,8 @@ from .exceptions import (
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
 _DIRECT_URL_CACHE_TTL_SECONDS = 10 * 60
+_HLS_REDIRECT_CACHE_TTL_SECONDS = 10 * 60
+_HLS_UNAVAILABLE_CACHE_TTL_SECONDS = 5
 _MERGED_HLS_CACHE_TTL_SECONDS = 10 * 60
 _HLS_PATH = re.compile(r"^hls/([A-Za-z0-9_-]{16,})/segment/(\d+)\.ts$")
 _MERGED_HLS_PATH = re.compile(
@@ -65,6 +67,13 @@ class _DirectEntry:
     direct: Cloud115DirectUrl
     usable_until: float
     slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
+
+
+@dataclass(slots=True)
+class _HlsRedirectEntry:
+    # None 只表示上游明确没有 HLS，不存储鉴权、风控或网络错误。
+    playlist_url: str | None
+    usable_until: float
 
 
 @dataclass(slots=True)
@@ -94,6 +103,8 @@ class _PlaybackCache:
 
     def __init__(self) -> None:
         self._direct: OrderedDict[tuple[object, ...], _DirectEntry] = OrderedDict()
+        self._hls_redirects: OrderedDict[tuple[object, ...], _HlsRedirectEntry] = OrderedDict()
+        self.hls_redirect_tasks: dict[tuple[object, ...], asyncio.Task[_HlsRedirectEntry]] = {}
         self._hls: OrderedDict[str, _HlsEntry] = OrderedDict()
         self._merged_hls: OrderedDict[str, _MergedHlsEntry] = OrderedDict()
 
@@ -118,6 +129,29 @@ class _PlaybackCache:
 
     def discard_direct(self, key: tuple[object, ...]) -> None:
         self._direct.pop(key, None)
+
+    def hls_redirect_for(self, key: tuple[object, ...]) -> _HlsRedirectEntry | None:
+        entry = self._hls_redirects.get(key)
+        if entry is None or entry.usable_until <= time.monotonic():
+            self._hls_redirects.pop(key, None)
+            return None
+        self._hls_redirects.move_to_end(key)
+        return entry
+
+    def put_hls_redirect(
+        self, key: tuple[object, ...], playlist_url: str | None
+    ) -> _HlsRedirectEntry:
+        ttl = (
+            _HLS_REDIRECT_CACHE_TTL_SECONDS
+            if playlist_url is not None
+            else _HLS_UNAVAILABLE_CACHE_TTL_SECONDS
+        )
+        entry = _HlsRedirectEntry(playlist_url, time.monotonic() + ttl)
+        self._hls_redirects[key] = entry
+        self._hls_redirects.move_to_end(key)
+        while len(self._hls_redirects) > 128:
+            self._hls_redirects.popitem(last=False)
+        return entry
 
     def put_hls(
         self,
@@ -267,17 +301,67 @@ class Cloud115Playback:
             return await self._hls_segment(media=media, context=context, pickcode=pickcode)
         try:
             if context.delivery == "redirect":
-                async with Cloud115Client(self._device_cookie) as client:
-                    info = await client.get_video_info(pickcode)
-                definition = choose_hls_definition(info.definitions)
-                return RedirectResponse(definition.playlist_url, status_code=302)
+                user_agent = context.request.headers.get("user-agent")
+                if not user_agent:
+                    raise _provider_error(
+                        "playback", "unsupported", "直连播放需要播放器提供 User-Agent"
+                    )
+                entry = await self._hls_redirect_entry(
+                    media=media, pickcode=pickcode, user_agent=user_agent
+                )
+                if entry.playlist_url is not None:
+                    return RedirectResponse(entry.playlist_url, status_code=302)
+                return await self._redirect(
+                    media=media, pickcode=pickcode, user_agent=user_agent
+                )
             return await self._proxy_root(media=media, pickcode=pickcode, context=context)
         except Cloud115VideoUnavailableError:
-            if context.delivery == "redirect":
-                return await self._redirect(media=media, pickcode=pickcode, context=context)
             return await self._direct_relay(media=media, pickcode=pickcode, context=context)
         except Cloud115Error as exc:
             raise _cloud_error("playback", exc) from exc
+
+    async def _hls_redirect_entry(
+        self, *, media: MediaHandle, pickcode: str, user_agent: str
+    ) -> _HlsRedirectEntry:
+        key = (
+            media.library.library_id,
+            media.media_id,
+            self._credential_fingerprint,
+            pickcode,
+            user_agent,
+        )
+        entry = _CACHE.hls_redirect_for(key)
+        if entry is not None:
+            return entry
+        task = _CACHE.hls_redirect_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                self._resolve_hls_redirect(key, pickcode, user_agent)
+            )
+            _CACHE.hls_redirect_tasks[key] = task
+            # 即使所有播放器请求都取消，也消费后台解析的异常，避免悬空任务告警。
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        # 一个播放器取消请求，不应取消其他请求正在等待的同一次解析。
+        return await asyncio.shield(task)
+
+    async def _resolve_hls_redirect(
+        self, key: tuple[object, ...], pickcode: str, user_agent: str
+    ) -> _HlsRedirectEntry:
+        try:
+            try:
+                # 交互式播放解析不进入批量请求间隔队列。
+                async with Cloud115Client(
+                    self._device_cookie,
+                    user_agent=user_agent,
+                    pace_webapi=False,
+                ) as client:
+                    info = await client.get_video_info(pickcode)
+                playlist_url = choose_hls_definition(info.definitions).playlist_url
+            except Cloud115VideoUnavailableError:
+                playlist_url = None
+            return _CACHE.put_hls_redirect(key, playlist_url)
+        finally:
+            _CACHE.hls_redirect_tasks.pop(key, None)
 
     async def handle_merged(
         self,
@@ -309,13 +393,8 @@ class Cloud115Playback:
         )
 
     async def _redirect(
-        self, *, media: MediaHandle, pickcode: str, context: PlaybackContext
+        self, *, media: MediaHandle, pickcode: str, user_agent: str
     ) -> Response:
-        user_agent = context.request.headers.get("user-agent")
-        if not user_agent:
-            raise _provider_error(
-                "playback", "unsupported", "直连播放需要播放器提供 User-Agent"
-            )
         _, entry = await self._direct_entry(
             media=media,
             pickcode=pickcode,
