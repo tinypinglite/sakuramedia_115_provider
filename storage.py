@@ -9,6 +9,7 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -30,6 +31,7 @@ from src.plugins.provider_protocol import (
     MediaTransferSource,
     PlaybackContext,
     ProviderOperationError,
+    ScanProgressCallback,
     StagedMedia,
     StagedMediaTransfer,
     ThumbnailArtifact,
@@ -177,7 +179,10 @@ class Cloud115StorageProvider:
         next_cursor = str(offset + len(entries)) if offset + len(entries) < total else None
         return BrowsePage(entries=result, next_cursor=next_cursor)
 
-    def scan_import_source(self, *, source_ref: JsonObject) -> tuple[ImportFile, ...]:
+    def scan_import_source(
+        self, *, source_ref: JsonObject,
+        progress_callback: ScanProgressCallback | None = None,
+    ) -> tuple[ImportFile, ...]:
         if not isinstance(source_ref, dict):
             raise _error("scan_import_source", "source_not_found", "115 导入源无效")
         kind = source_ref.get("kind")
@@ -192,7 +197,7 @@ class Cloud115StorageProvider:
             cid = _directory_ref(source_ref, operation="scan_import_source")
             started = time.monotonic()
             logger.info("115 导入源扫描开始 library_id={} cid={}", self.library.library_id, cid)
-            files = tuple(run_sync(self._scan_dir(cid)))
+            files = tuple(run_sync(self._scan_dir(cid, progress_callback)))
             logger.info("115 导入源扫描完成 library_id={} cid={} files={} elapsed_seconds={:.2f}",
                         self.library.library_id, cid, len(files), time.monotonic() - started)
             return files
@@ -284,9 +289,43 @@ class Cloud115StorageProvider:
             operation="managed_media_ref_key",
         ).pickcode
 
-    async def _scan_dir(self, root_cid: str) -> list[ImportFile]:
-        async with Cloud115Client(self._device_cookie) as client:
+    async def _scan_dir(
+        self, root_cid: str, progress_callback: ScanProgressCallback | None = None,
+    ) -> list[ImportFile]:
+        last_report = last_log = float("-inf")
+        stage = "扫描文件"
+        current = total = 0
+
+        def report(*, force=False, action=""):
+            nonlocal last_report, last_log
+            now = time.monotonic()
+            text = f"{stage} · 已处理 {current}/{total}" if total else f"{stage} · 已检查 {current}"
+            if action:
+                text += f" · {action}"
+            if force or now - last_log >= 10:
+                logger.info("115 导入扫描进度 library_id={} cid={} {}", self.library.library_id, root_cid, text)
+                last_log = now
+            if progress_callback is not None and (force or now - last_report >= 2):
+                progress_callback({"current": current, "total": total, "text": text})
+                last_report = now
+
+        def file_progress(payload):
+            nonlocal current, total
+            if "wait_seconds" in payload:
+                wait_seconds = payload["wait_seconds"]
+                report(force=True, action=(
+                    f"115 请求节流 · 等待 {wait_seconds:.0f} 秒"
+                    if wait_seconds > 0 else "节流等待结束 · 等待 115 响应"
+                ))
+            if "current" in payload:
+                current, total = payload["current"], payload["total"]
+                report(force=current == total)
+
+        report(force=True, action="等待 115 响应")
+        async with Cloud115Client(self._device_cookie, progress_callback=file_progress) as client:
             source_entries = [entry async for entry in client.iter_files_recursive(root_cid)]
+            current = total = len(source_entries)
+            report(force=True, action="完成")
             logger.info("115 导入源文件枚举完成，开始解析相对路径 library_id={} cid={} files={}",
                         self.library.library_id, root_cid, len(source_entries))
             relative_dirs: dict[str, tuple[str, ...]] = {root_cid: ()}
@@ -295,17 +334,24 @@ class Cloud115StorageProvider:
                 for entry in source_entries
                 if entry.parent_id and entry.parent_id != root_cid
             }
+            stage = "解析目录路径"
+            current, total = 0, len(pending_parent_ids)
+            report(force=True)
             offset = 0
             while pending_parent_ids:
-                entries, total = await client.list_dir(root_cid, offset=offset, limit=1150)
+                report(action="等待 115 目录列表响应")
+                entries, page_total = await client.list_dir(root_cid, offset=offset, limit=1150)
                 for entry in entries:
                     if entry.is_dir and entry.entry_id in pending_parent_ids:
                         relative_dirs[entry.entry_id] = (entry.name,)
                         pending_parent_ids.discard(entry.entry_id)
+                        current += 1
+                report()
                 offset += len(entries)
-                if not entries or offset >= total:
+                if not entries or offset >= page_total:
                     break
             for parent_cid in sorted(pending_parent_ids):
+                report(action="等待 115 目录详情响应")
                 directory = await client.directory_info(parent_cid)
                 parts: list[str] = []
                 found_root = False
@@ -317,6 +363,9 @@ class Cloud115StorageProvider:
                 if not found_root:
                     raise Cloud115NotFoundError("115 文件不在导入源目录下")
                 relative_dirs[parent_cid] = (*parts, directory.name)
+                current += 1
+                report()
+            report(force=True, action="完成")
             files = [
                 self._import_file(
                     entry,
@@ -1038,7 +1087,12 @@ class Cloud115StorageProvider:
             max_fetched_bytes=COVER_MAX_FETCHED_BYTES,
         )
 
-    def generate_thumbnails(self, *, media: MediaHandle, workspace: Path) -> ThumbnailGeneration:
+    def generate_thumbnails(
+        self, *, media: MediaHandle, workspace: Path,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> ThumbnailGeneration:
+        if progress_callback:
+            progress_callback("正在获取视频分片")
         try:
             import av
             from PIL import Image
@@ -1079,6 +1133,8 @@ class Cloud115StorageProvider:
         last_progress_log_at = started_at
         completed_segments = 0
         generated_thumbnails = 0
+        if progress_callback:
+            progress_callback(f"正在生成缩略图 · 已生成 0/{expected_count} 张")
 
         def log_progress() -> None:
             logger.info(
@@ -1138,6 +1194,11 @@ class Cloud115StorageProvider:
                             futures[future],
                             safe_error_message(exc),
                         )
+                if progress_callback:
+                    progress_callback(
+                        f"正在生成缩略图 · 已生成 {generated_thumbnails}/{expected_count} 张"
+                        f" · 分片 {completed_segments}/{total_segments}"
+                    )
                 if (
                     completed_segments >= next_segment_log
                     or now - last_progress_log_at >= THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS

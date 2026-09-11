@@ -1,8 +1,8 @@
 {
   "plugin_id": "sakuramedia_115_provider",
   "display_name": "115 网盘",
-  "version": "0.2.3",
-  "host_api_version": 5,
+  "version": "0.2.4",
+  "host_api_version": 7,
   "requires_python": ">=3.10,<3.11",
   "dependencies": [],
   "author": "SakuraMedia",

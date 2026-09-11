@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -28,6 +29,7 @@ from src.plugins.provider_protocol import (
     MediaHandle,
     MediaTransferSourceInfo,
     ProviderOperationError,
+    ThumbnailArtifact,
 )
 
 
@@ -430,13 +432,56 @@ def test_scan_import_source_rebuilds_nested_relative_path(monkeypatch, tmp_path)
     ScanClient.directory_info_calls = []
     monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
 
+    progress = []
     files = _scan_provider(tmp_path).scan_import_source(
-        source_ref={"version": 1, "kind": "cloud115_dir", "cid": "source"}
+        source_ref={"version": 1, "kind": "cloud115_dir", "cid": "source"},
+        progress_callback=progress.append,
     )
 
     assert [item.relative_path for item in files] == ["ABC-001/CD1/ABC-001.mp4"]
     assert ScanClient.list_calls == [("source", 0, 1150)]
     assert ScanClient.directory_info_calls == ["deep"]
+    assert progress[0]["total"] == 0
+    assert any(p["text"].startswith("扫描文件") and p["current"] == p["total"] == 1 for p in progress)
+    directory_progress = [p for p in progress if p["text"].startswith("解析目录路径")]
+    assert directory_progress[0]["current"] == 0
+    assert directory_progress[-1]["current"] == directory_progress[-1]["total"] == 1
+
+
+def test_scan_reports_throttle_waits_without_changing_counts(monkeypatch, tmp_path) -> None:
+    progress = []
+
+    class WaitingClient(ScanClient):
+        def __init__(self, _cookie, *, progress_callback):
+            self.progress_callback = progress_callback
+
+        def report_wait(self, stage, current, total):
+            for seconds, text in [(30, "等待 30 秒"), (0, "节流等待结束")]:
+                before = len(progress)
+                self.progress_callback({"wait_seconds": seconds})
+                assert len(progress) == before + 1
+                assert progress[-1]["current"] == current
+                assert progress[-1]["total"] == total
+                assert progress[-1]["text"].startswith(stage)
+                assert text in progress[-1]["text"]
+
+        async def iter_files_recursive(self, cid):
+            self.progress_callback({"current": 1, "total": 2})
+            self.report_wait("扫描文件", 1, 2)
+            yield Cloud115Entry("movie", "child", "ABC-001.mp4", False, 99, "sha", "pc", 0, True)
+
+        async def list_dir(self, cid, *, offset, limit):
+            self.report_wait("解析目录路径", 0, 1)
+            return (Cloud115Entry("child", cid, "folder", True, 0, None, "", 0, False),), 1
+
+    monkeypatch.setattr(storage, "Cloud115Client", WaitingClient)
+    monkeypatch.setattr(storage.time, "monotonic", lambda: 0.0)
+    files = _scan_provider(tmp_path).scan_import_source(
+        source_ref={"version": 1, "kind": "cloud115_dir", "cid": "source"},
+        progress_callback=progress.append,
+    )
+    assert [item.relative_path for item in files] == ["folder/ABC-001.mp4"]
+    assert progress[-1]["current"] == progress[-1]["total"] == 1
 
 
 def test_scan_media_refs_skips_relative_path_queries(monkeypatch, tmp_path) -> None:
@@ -900,6 +945,29 @@ def test_compute_file_hash_rejects_a_changed_remote_size(monkeypatch, tmp_path) 
         provider.compute_file_hash(media=_hash_media(100))
 
     assert exc_info.value.code == "unavailable"
+
+
+def test_thumbnail_generation_reports_target_lookup_and_generated_counts(monkeypatch, tmp_path):
+    media = _hash_media(10)
+    provider = storage.Cloud115StorageProvider(library=media.library, data_dir=tmp_path)
+    progress = []
+
+    async def targets(_media):
+        assert progress == ["正在获取视频分片"]
+        return [(SimpleNamespace(index=0), [0, 10])], 2
+
+    monkeypatch.setattr(provider, "_thumbnail_targets", targets)
+    monkeypatch.setattr(
+        provider, "_decode_hls_segment",
+        lambda **_kwargs: [ThumbnailArtifact(0, "0.webp"), ThumbnailArtifact(10, "10.webp")],
+    )
+    generation = provider.generate_thumbnails(
+        media=media, workspace=tmp_path / "thumbnails", progress_callback=progress.append,
+    )
+    assert len(generation.artifacts) == 2
+    assert "已生成 0/2 张" in progress[1]
+    assert "已生成 2/2 张" in progress[-1]
+    assert "分片 1/1" in progress[-1]
 
 
 def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
