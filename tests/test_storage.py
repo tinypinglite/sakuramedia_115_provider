@@ -60,6 +60,14 @@ class FakeClient:
         if parent_cid:
             type(self).entries[parent_cid] = []
 
+    async def get_video_metadata(self, _pickcode: str):
+        return {
+            "container": {"size_bytes": 99, "duration_seconds": 31,
+                          "bit_rate": 25, "bit_rate_estimated": True},
+            "video": {"width": 1920, "height": 1080},
+            "audio": None, "subtitles": [],
+        }
+
     async def get_video_info(self, _pickcode: str) -> Cloud115VideoInfo:
         return Cloud115VideoInfo(
             definitions=(
@@ -589,6 +597,12 @@ def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch,
         "123",
     )
     provider = storage.Cloud115StorageProvider(library=library, data_dir=tmp_path)
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("metadata must not read direct URLs or HLS")
+
+    monkeypatch.setattr(FakeClient, "get_video_info", forbidden)
+    monkeypatch.setattr(FakeClient, "get_video_segments", forbidden)
+
     source = ImportFile(
         source_ref={
             "version": 1,
@@ -616,6 +630,9 @@ def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch,
 
     assert staged.storage_ref["kind"] == "cloud115_media"
     assert staged.storage_ref["pickcode"] == "target-pc"
+    assert staged.video_info["container"]["bit_rate"] == 25
+    assert staged.video_info["container"]["bit_rate_estimated"] is True
+    assert staged.video_info["video"] == {"width": 1920, "height": 1080}
     assert staged.duration_seconds == 31
     assert staged.resolution == "1920x1080"
     assert provider.probe_duration_seconds(
@@ -700,24 +717,13 @@ def test_stage_supports_legacy_staged_media_contract(monkeypatch, tmp_path) -> N
     assert not hasattr(staged, "resolution")
 
 
-def test_resolution_probe_treats_missing_hls_resolution_as_unknown() -> None:
+def test_resolution_probe_treats_missing_api_resolution_as_unknown() -> None:
     class NoResolutionClient:
-        async def get_video_info(self, _pickcode: str) -> Cloud115VideoInfo:
-            return Cloud115VideoInfo(
-                definitions=(
-                    Cloud115VideoDefinition(
-                        300,
-                        "",
-                        "原画",
-                        "https://hls.example/video.m3u8",
-                    ),
-                )
-            )
-
-        async def get_video_segments(
-            self, _definition: Cloud115VideoDefinition
-        ) -> tuple[Cloud115VideoSegment, ...]:
-            return (Cloud115VideoSegment(0, "https://hls.example/0.ts", 31),)
+        async def get_video_metadata(self, _pickcode: str):
+            return {
+                "container": {"duration_seconds": 31},
+                "video": {"width": None, "height": None},
+            }
 
     entry = Cloud115Entry(
         "source-fid",
@@ -751,16 +757,16 @@ def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
         created_directories.append((parent_cid, name))
         return f"{parent_cid}/{name}"
 
-    async def unavailable(_client, _entry) -> int:
-        raise Cloud115VideoUnavailableError("115 视频转码尚未就绪")
+    async def unavailable(_client, _pickcode):
+        raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
 
     FakeClient.entries = {}
     monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
     monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
     monkeypatch.setattr(
-        storage.Cloud115StorageProvider,
-        "_probe_duration_and_resolution_with_client",
-        staticmethod(unavailable),
+        FakeClient,
+        "get_video_metadata",
+        unavailable,
     )
     library = LibraryHandle(
         1,
@@ -1196,3 +1202,52 @@ def test_download_import_directory_cache_scope(
     assert sum(reads.count(f"{root}/jav") for root in {"media", next_root}) == expected_reads
     assert created.count("media/jav") == 1
     assert created.count("media/jav/ABC-001") == 1
+
+
+def test_video_info_uses_api_without_reading_original_or_hls(monkeypatch, tmp_path):
+    calls = []
+
+    class Client:
+        def __init__(self, _cookie):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def get_video_metadata(self, pickcode):
+            calls.append(pickcode)
+            return {
+                "container": {"size_bytes": 8318079847, "duration_seconds": 10773,
+                              "bit_rate": 8318079847 * 8 // 10773, "bit_rate_estimated": True},
+                "video": {"width": 1920, "height": 1080},
+                "audio": None, "subtitles": [],
+            }
+
+    monkeypatch.setattr(storage, "Cloud115Client", Client)
+    provider = _scan_provider(tmp_path)
+    entry = Cloud115Entry("fid", "parent", "movie.mp4", False, 99, "sha", "pc", 0, True)
+    media = MediaHandle(
+        media_id=1, library=provider.library, storage_ref=storage._media_ref(entry),
+        file_name="movie.mp4", file_size_bytes=99, duration_seconds=0,
+    )
+    info = provider.probe_video_info(media=media)
+    assert info["container"]["size_bytes"] == 8318079847
+    assert info["container"]["bit_rate_estimated"] is True
+    assert info["video"] == {"width": 1920, "height": 1080}
+    assert info["audio"] is None
+    assert calls == ["pc"]
+
+
+def test_video_info_unavailable_keeps_missing_value(monkeypatch, tmp_path):
+    class Client(FakeClient):
+        async def get_video_metadata(self, _pickcode):
+            raise Cloud115VideoUnavailableError("video metadata unavailable")
+
+    monkeypatch.setattr(storage, "Cloud115Client", Client)
+    entry = Cloud115Entry("fid", "parent", "movie.mp4", False, 99, "sha", "pc", 0, True)
+    provider = _scan_provider(tmp_path)
+    media = MediaHandle(1, provider.library, storage._media_ref(entry), "movie.mp4", 99, 0)
+    assert provider.probe_video_info(media=media) is None

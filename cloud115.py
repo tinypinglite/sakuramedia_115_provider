@@ -966,6 +966,33 @@ class Cloud115Client:
             raise Cloud115RequestError("115 文件读取失败") from exc
         return b"".join(chunks)
 
+    async def get_video_metadata(self, pickcode: str) -> dict[str, Any]:
+        payload = await self._json(
+            "GET",
+            "https://webapi.115.com/files/video",
+            params={"pickcode": pickcode},
+        )
+        size = _as_int(payload.get("file_size"))
+        duration = _as_int(payload.get("play_long"))
+        if size <= 0 or duration <= 0:
+            raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
+        width = _as_int(payload.get("width"))
+        height = _as_int(payload.get("height"))
+        return {
+            "container": {
+                "size_bytes": size,
+                "duration_seconds": duration,
+                "bit_rate": size * 8 // duration,
+                "bit_rate_estimated": True,
+            },
+            "video": {
+                "width": width if width > 0 else None,
+                "height": height if height > 0 else None,
+            },
+            "audio": None,
+            "subtitles": [],
+        }
+
     async def get_video_info(self, pickcode: str) -> Cloud115VideoInfo:
         payload = await self._json(
             "GET",

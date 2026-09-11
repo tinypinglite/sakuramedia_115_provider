@@ -522,6 +522,55 @@ def test_direct_url_issuance_binds_the_requested_user_agent(monkeypatch) -> None
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("width,height", [(1920, 1080), ("1920", "1080"), (None, None)])
+def test_video_metadata_uses_live_api_fields_without_hls(width, height) -> None:
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.path == "/files/video"
+        assert request.url.params["pickcode"] == "pc"
+        return httpx.Response(200, json={
+            "state": True, "file_size": "8318079847", "play_long": "10773",
+            "width": width, "height": height,
+            "definition_list": {"3000000": "1080P"},
+        })
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = Cloud115Client("UID=123_R1_x; CID=c; SEID=s", http_client=http)
+            info = await client.get_video_metadata("pc")
+            assert info == {
+                "container": {
+                    "size_bytes": 8318079847, "duration_seconds": 10773,
+                    "bit_rate": 8318079847 * 8 // 10773, "bit_rate_estimated": True,
+                },
+                "video": {"width": 1920 if width else None, "height": 1080 if height else None},
+                "audio": None, "subtitles": [],
+            }
+
+    asyncio.run(run())
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("play_long", None), ("play_long", "0"), ("play_long", "invalid"),
+    ("file_size", None), ("file_size", "0"),
+])
+def test_video_metadata_rejects_missing_size_or_duration(field, value):
+    payload = {"state": True, "file_size": "1000", "play_long": "10", field: value}
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+        ) as http:
+            client = Cloud115Client("UID=123_R1_x; CID=c; SEID=s", http_client=http)
+            with pytest.raises(Cloud115VideoUnavailableError):
+                await client.get_video_metadata("pc")
+
+    asyncio.run(run())
+
+
 def test_hls_playlists_are_parsed_with_one_stable_user_agent() -> None:
     seen_user_agents: list[str] = []
 
