@@ -1100,6 +1100,77 @@ def test_generate_range_thumbnails_uses_three_second_delay_and_writes_frames(
     assert progress[-1] == "正在使用原文件 Range 生成缩略图 · 已生成 3/3 张"
 
 
+def test_generate_range_thumbnails_reads_duration_from_container_when_media_lacks_it(
+    monkeypatch, tmp_path
+) -> None:
+    media = replace(_hash_media(99), duration_seconds=0)
+    provider = storage.Cloud115StorageProvider(library=media.library, data_dir=tmp_path)
+    workspace = tmp_path / "thumbnails"
+    workspace.mkdir()
+    seeks = []
+
+    class Reader:
+        fetched_bytes = 0
+
+        def close(self):
+            pass
+
+    class Image:
+        def thumbnail(self, *_args):
+            pass
+
+        def save(self, destination, **_kwargs):
+            destination.write_bytes(b"webp")
+
+        def close(self):
+            pass
+
+    class Frame:
+        is_corrupt = False
+
+        def to_image(self):
+            return Image()
+
+    class Container:
+        duration = 25_000_000
+        streams = SimpleNamespace(video=[object()])
+
+        def seek(self, offset, **_kwargs):
+            seeks.append(offset)
+
+        def decode(self, _video):
+            return iter((Frame(),))
+
+        def close(self):
+            pass
+
+    class AV:
+        time_base = 1_000_000
+
+        @staticmethod
+        def open(_reader, *, mode):
+            assert mode == "r"
+            return Container()
+
+    class ImageModule:
+        class Resampling:
+            LANCZOS = object()
+
+    monkeypatch.setattr(provider, "_range_reader", lambda *_args, **_kwargs: Reader())
+
+    generation = provider._generate_range_thumbnails(
+        media=media,
+        workspace=workspace,
+        av=AV,
+        image_module=ImageModule,
+        progress_callback=None,
+    )
+
+    assert generation.expected_count == 3
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
+    assert seeks == [0, 10_000_000, 20_000_000]
+
+
 def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
     targets, expected_count = storage._thumbnail_targets(
         (

@@ -1298,14 +1298,6 @@ class Cloud115StorageProvider:
         image_module,
         progress_callback: Callable[[str], None] | None,
     ) -> ThumbnailGeneration:
-        duration = int(media.duration_seconds or 0)
-        if duration <= 0:
-            raise ThumbnailBackendUnavailable(
-                "115 原文件视频时长无效",
-                error_code="cloud115_thumbnail_unavailable",
-            )
-        offsets = tuple(range(0, duration, THUMBNAIL_INTERVAL_SECONDS))
-        expected_count = len(offsets)
         reader = self._range_reader(
             media,
             operation="generate_thumbnails",
@@ -1314,14 +1306,25 @@ class Cloud115StorageProvider:
         )
         container = None
         artifacts: list[ThumbnailArtifact] = []
+        expected_count = 0
         started_at = time.monotonic()
-        if progress_callback:
-            progress_callback(f"正在使用原文件 Range 生成缩略图 · 已生成 0/{expected_count} 张")
         try:
             container = av.open(reader, mode="r")
             if not container.streams.video:
                 raise ValueError("video stream missing")
             video = container.streams.video[0]
+            duration = _container_duration_seconds(container, video, av) or int(
+                media.duration_seconds or 0
+            )
+            if duration <= 0:
+                raise ThumbnailBackendUnavailable(
+                    "115 原文件视频时长无效",
+                    error_code="cloud115_thumbnail_unavailable",
+                )
+            offsets = tuple(range(0, duration, THUMBNAIL_INTERVAL_SECONDS))
+            expected_count = len(offsets)
+            if progress_callback:
+                progress_callback(f"正在使用原文件 Range 生成缩略图 · 已生成 0/{expected_count} 张")
             for offset in offsets:
                 if progress_callback:
                     progress_callback(
@@ -1739,6 +1742,22 @@ def _thumbnail_targets(
         grouped[segment.index] = (segment, [0])
     targets = list(grouped.values())
     return targets, sum(len(offsets) for _, offsets in targets)
+
+
+def _container_duration_seconds(container, video, av) -> int:
+    stream_duration = getattr(video, "duration", None)
+    stream_time_base = getattr(video, "time_base", None)
+    if stream_duration and stream_time_base:
+        seconds = int(stream_duration * stream_time_base)
+        if seconds > 0:
+            return seconds
+    container_duration = getattr(container, "duration", None)
+    time_base = getattr(av, "time_base", None)
+    if container_duration and time_base:
+        seconds = int(container_duration / time_base)
+        if seconds > 0:
+            return seconds
+    return 0
 
 
 def _is_video(name: str) -> bool:
