@@ -37,7 +37,6 @@ from src.plugins.provider_protocol import (
     ThumbnailArtifact,
     ThumbnailBackendUnavailable,
     ThumbnailGeneration,
-    ThumbnailGenerationDeferred,
 )
 
 from .cloud115 import (
@@ -73,6 +72,7 @@ THUMBNAIL_INTERVAL_SECONDS = 10
 THUMBNAIL_HLS_MAX_WORKERS = 1
 THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL = 50
 THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS = 5
+THUMBNAIL_RANGE_REQUEST_DELAY_RANGE = (3.0, 3.0)
 COVER_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 _HASH_DOMAIN = b"media-file-hash-v1"
 _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
@@ -1117,13 +1117,15 @@ class Cloud115StorageProvider:
         try:
             targets, expected_count = run_sync(self._thumbnail_targets(media))
         except Cloud115VideoUnavailableError as exc:
-            logger.info("115 缩略图生成延期 library_id={} media_id={} reason={}", self.library.library_id, media.media_id, safe_error_message(exc))
-            raise ThumbnailGenerationDeferred(
-                "115 视频转码尚未完成",
-                error_code="cloud115_video_transcoding",
-                max_deferred_attempts=5,
-                deferred_backoff_base_seconds=12 * 60 * 60,
-            ) from exc
+            logger.info("115 缩略图无 HLS，回退原文件 Range library_id={} media_id={} reason={}",
+                        self.library.library_id, media.media_id, safe_error_message(exc))
+            return self._generate_range_thumbnails(
+                media=media,
+                workspace=workspace,
+                av=av,
+                image_module=Image,
+                progress_callback=progress_callback,
+            )
         except Cloud115NotFoundError as exc:
             logger.warning("115 缩略图目标不存在 library_id={} media_id={} reason={}",
                            self.library.library_id, media.media_id, safe_error_message(exc))
@@ -1287,6 +1289,103 @@ class Cloud115StorageProvider:
                 container.close()
             reader.close()
 
+    def _generate_range_thumbnails(
+        self,
+        *,
+        media: MediaHandle,
+        workspace: Path,
+        av,
+        image_module,
+        progress_callback: Callable[[str], None] | None,
+    ) -> ThumbnailGeneration:
+        duration = int(media.duration_seconds or 0)
+        if duration <= 0:
+            raise ThumbnailBackendUnavailable(
+                "115 原文件视频时长无效",
+                error_code="cloud115_thumbnail_unavailable",
+            )
+        offsets = tuple(range(0, duration, THUMBNAIL_INTERVAL_SECONDS))
+        expected_count = len(offsets)
+        reader = self._range_reader(
+            media,
+            operation="generate_thumbnails",
+            max_fetched_bytes=media.file_size_bytes,
+            request_delay_range=THUMBNAIL_RANGE_REQUEST_DELAY_RANGE,
+        )
+        container = None
+        artifacts: list[ThumbnailArtifact] = []
+        started_at = time.monotonic()
+        if progress_callback:
+            progress_callback(f"正在使用原文件 Range 生成缩略图 · 已生成 0/{expected_count} 张")
+        try:
+            container = av.open(reader, mode="r")
+            if not container.streams.video:
+                raise ValueError("video stream missing")
+            video = container.streams.video[0]
+            for offset in offsets:
+                if progress_callback:
+                    progress_callback(
+                        f"正在使用原文件 Range 生成缩略图 · 读取 {offset} 秒"
+                        f" · 已生成 {len(artifacts)}/{expected_count} 张"
+                    )
+                try:
+                    container.seek(offset * av.time_base, backward=True, any_frame=False)
+                    frame = next(
+                        (item for item in container.decode(video) if not item.is_corrupt),
+                        None,
+                    )
+                    if frame is None:
+                        raise ValueError("clean frame missing")
+                    image = frame.to_image()
+                    try:
+                        image.thumbnail((640, 360), image_module.Resampling.LANCZOS)
+                        destination = workspace / f"thumbnail-{offset}.webp"
+                        image.save(destination, format="WEBP", quality=82, method=4)
+                    finally:
+                        image.close()
+                except Cloud115RequestError as exc:
+                    raise ThumbnailBackendUnavailable(
+                        "115 原文件 Range 读取失败",
+                        error_code="cloud115_thumbnail_unavailable",
+                    ) from exc
+                except Exception as exc:
+                    logger.warning(
+                        "115 原文件 Range 缩略图生成失败 library_id={} media_id={} offset_seconds={} reason={}",
+                        self.library.library_id,
+                        media.media_id,
+                        offset,
+                        safe_error_message(exc),
+                    )
+                    continue
+                artifacts.append(
+                    ThumbnailArtifact(
+                        offset_seconds=offset,
+                        relative_path=f"thumbnail-{offset}.webp",
+                    )
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"正在使用原文件 Range 生成缩略图 · 已生成 {len(artifacts)}/{expected_count} 张"
+                    )
+        finally:
+            if container is not None:
+                container.close()
+            reader.close()
+            logger.info(
+                "115 原文件 Range 缩略图生成结束 library_id={} media_id={} generated_thumbnails={} "
+                "expected_thumbnails={} fetched_bytes={} elapsed_seconds={:.2f}",
+                self.library.library_id,
+                media.media_id,
+                len(artifacts),
+                expected_count,
+                reader.fetched_bytes,
+                time.monotonic() - started_at,
+            )
+        return ThumbnailGeneration(
+            expected_count=expected_count,
+            artifacts=tuple(artifacts),
+        )
+
     def create_clip(
         self,
         *,
@@ -1385,6 +1484,7 @@ class Cloud115StorageProvider:
         *,
         operation: str,
         max_fetched_bytes: int,
+        request_delay_range: tuple[float, float] | None = None,
     ) -> Cloud115RangeReader:
         entry = _media_entry(media.storage_ref, operation=operation)
 
@@ -1409,6 +1509,7 @@ class Cloud115StorageProvider:
             user_agent=direct.user_agent,
             file_size_bytes=size,
             max_fetched_bytes=max_fetched_bytes,
+            request_delay_range=request_delay_range,
         )
 
     @staticmethod

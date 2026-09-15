@@ -30,6 +30,7 @@ from src.plugins.provider_protocol import (
     MediaTransferSourceInfo,
     ProviderOperationError,
     ThumbnailArtifact,
+    ThumbnailGeneration,
 )
 
 
@@ -974,6 +975,129 @@ def test_thumbnail_generation_reports_target_lookup_and_generated_counts(monkeyp
     assert "已生成 0/2 张" in progress[1]
     assert "已生成 2/2 张" in progress[-1]
     assert "分片 1/1" in progress[-1]
+
+
+def test_thumbnail_generation_falls_back_to_range_when_hls_is_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    media = replace(_hash_media(99), duration_seconds=20)
+    provider = storage.Cloud115StorageProvider(library=media.library, data_dir=tmp_path)
+    calls = {}
+
+    async def unavailable(_media):
+        raise Cloud115VideoUnavailableError("115 未提供 HLS 播放列表")
+
+    def fallback(**kwargs):
+        calls.update(kwargs)
+        return ThumbnailGeneration(
+            expected_count=2,
+            artifacts=(ThumbnailArtifact(0, "thumbnail-0.webp"), ThumbnailArtifact(10, "thumbnail-10.webp")),
+        )
+
+    monkeypatch.setattr(provider, "_thumbnail_targets", unavailable)
+    monkeypatch.setattr(provider, "_generate_range_thumbnails", fallback)
+
+    generation = provider.generate_thumbnails(media=media, workspace=tmp_path / "thumbnails")
+
+    assert generation.expected_count == 2
+    assert len(generation.artifacts) == 2
+    assert calls["media"] is media
+
+
+def test_generate_range_thumbnails_uses_three_second_delay_and_writes_frames(
+    monkeypatch, tmp_path
+) -> None:
+    media = replace(_hash_media(99), duration_seconds=25)
+    provider = storage.Cloud115StorageProvider(library=media.library, data_dir=tmp_path)
+    workspace = tmp_path / "thumbnails"
+    workspace.mkdir()
+    reader_calls = []
+
+    class Reader:
+        fetched_bytes = 123
+
+        def close(self):
+            reader_calls.append(("close",))
+
+    class Image:
+        def __init__(self):
+            self.thumbnail_args = None
+
+        def thumbnail(self, size, resampling):
+            self.thumbnail_args = (size, resampling)
+
+        def save(self, destination, **_kwargs):
+            destination.write_bytes(b"webp")
+
+        def close(self):
+            pass
+
+    class Frame:
+        is_corrupt = False
+
+        def to_image(self):
+            return Image()
+
+    class Container:
+        streams = SimpleNamespace(video=[object()])
+
+        def seek(self, offset, **_kwargs):
+            seeks.append(offset)
+
+        def decode(self, _video):
+            return iter((Frame(),))
+
+        def close(self):
+            pass
+
+    seeks = []
+
+    class AV:
+        time_base = 1
+
+        @staticmethod
+        def open(_reader, *, mode):
+            assert mode == "r"
+            return Container()
+
+    class ImageModule:
+        class Resampling:
+            LANCZOS = object()
+
+    def range_reader(_media, *, operation, max_fetched_bytes, request_delay_range):
+        reader_calls.append((operation, max_fetched_bytes, request_delay_range))
+        return Reader()
+
+    monkeypatch.setattr(provider, "_range_reader", range_reader)
+    progress = []
+
+    generation = provider._generate_range_thumbnails(
+        media=media,
+        workspace=workspace,
+        av=AV,
+        image_module=ImageModule,
+        progress_callback=progress.append,
+    )
+
+    assert generation.expected_count == 3
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
+    assert [artifact.relative_path for artifact in generation.artifacts] == [
+        "thumbnail-0.webp",
+        "thumbnail-10.webp",
+        "thumbnail-20.webp",
+    ]
+    assert seeks == [0, 10, 20]
+    assert reader_calls == [
+        ("generate_thumbnails", 99, storage.THUMBNAIL_RANGE_REQUEST_DELAY_RANGE),
+        ("close",),
+    ]
+    assert all((workspace / name).read_bytes() == b"webp" for name in (
+        "thumbnail-0.webp",
+        "thumbnail-10.webp",
+        "thumbnail-20.webp",
+    ))
+    assert progress[0] == "正在使用原文件 Range 生成缩略图 · 已生成 0/3 张"
+    assert progress[-1] == "正在使用原文件 Range 生成缩略图 · 已生成 3/3 张"
 
 
 def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
