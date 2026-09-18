@@ -12,11 +12,13 @@ from sakuramedia_115_provider.cloud115 import (
     Cloud115DirectUrl,
     Cloud115Entry,
     Cloud115RapidUploadResult,
+    Cloud115SpaceUsage,
     Cloud115VideoDefinition,
     Cloud115VideoInfo,
     Cloud115VideoSegment,
 )
 from sakuramedia_115_provider.exceptions import (
+    Cloud115AuthError,
     Cloud115NotFoundError,
     Cloud115RiskControlError,
     Cloud115VideoUnavailableError,
@@ -580,6 +582,46 @@ def test_scan_managed_media_ref_keys_maps_risk_control_to_retryable_unavailable(
     assert error.value.operation == "scan_managed_media_ref_keys"
     assert error.value.code == "unavailable"
     assert error.value.retryable is True
+
+
+class SpaceClient:
+    usage: ClassVar[Cloud115SpaceUsage] = Cloud115SpaceUsage(1000, 600, 400)
+    error: ClassVar[Exception | None] = None
+
+    def __init__(self, _cookie: str, **_kwargs) -> None:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+    async def space_usage(self) -> Cloud115SpaceUsage:
+        if type(self).error is not None:
+            raise type(self).error
+        return type(self).usage
+
+
+def test_space_usage_maps_account_capacity(monkeypatch, tmp_path) -> None:
+    SpaceClient.usage = Cloud115SpaceUsage(1000, 600, 400)
+    SpaceClient.error = None
+    monkeypatch.setattr(storage, "Cloud115Client", SpaceClient)
+
+    usage = _scan_provider(tmp_path).get_space_usage()
+
+    assert (usage.total_bytes, usage.used_bytes, usage.free_bytes) == (1000, 600, 400)
+
+
+def test_space_usage_maps_expired_login(monkeypatch, tmp_path) -> None:
+    SpaceClient.error = Cloud115AuthError("expired")
+    monkeypatch.setattr(storage, "Cloud115Client", SpaceClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).get_space_usage()
+
+    assert error.value.operation == "get_space_usage"
+    assert error.value.code == "authentication_failed"
 
 
 def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch, tmp_path) -> None:

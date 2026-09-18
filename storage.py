@@ -34,6 +34,7 @@ from src.plugins.provider_protocol import (
     ScanProgressCallback,
     StagedMedia,
     StagedMediaTransfer,
+    StorageSpaceUsage,
     ThumbnailArtifact,
     ThumbnailBackendUnavailable,
     ThumbnailGeneration,
@@ -294,6 +295,23 @@ class Cloud115StorageProvider:
             media_ref,
             operation="managed_media_ref_key",
         ).pickcode
+
+    def get_space_usage(self) -> StorageSpaceUsage:
+        async def query():
+            async with Cloud115Client(self._device_cookie) as client:
+                return await client.space_usage()
+
+        try:
+            usage = run_sync(query())
+        except Cloud115Error as exc:
+            logger.warning("115 操作失败 library_id={} operation={} error_type={} reason={}",
+                           self.library.library_id, "get_space_usage", type(exc).__name__, safe_error_message(exc))
+            raise _cloud_error("get_space_usage", exc) from exc
+        return StorageSpaceUsage(
+            total_bytes=usage.total_bytes,
+            used_bytes=usage.used_bytes,
+            free_bytes=usage.free_bytes,
+        )
 
     async def _scan_dir(
         self, root_cid: str, progress_callback: ScanProgressCallback | None = None,

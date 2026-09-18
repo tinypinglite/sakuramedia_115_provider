@@ -483,6 +483,71 @@ def test_directory_info_parses_ancestor_breadcrumbs(monkeypatch) -> None:
     )
 
 
+def test_space_usage_maps_float_sizes_to_bytes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "webapi.115.com"
+        assert request.url.path == "/user/space"
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "error": "",
+                "data": {
+                    "all_total": {"size": 1000.9, "size_format": "1.0KB"},
+                    "all_use": {"size": 600.1, "size_format": "600B"},
+                    "all_remain": {"size": 400.8, "size_format": "400B"},
+                },
+            },
+        )
+
+    async def run():
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+                pace_webapi=False,
+            )
+            return await client.space_usage()
+        finally:
+            await http_client.aclose()
+
+    usage = asyncio.run(run())
+
+    assert (usage.total_bytes, usage.used_bytes, usage.free_bytes) == (1000, 600, 400)
+
+
+def test_space_usage_tolerates_missing_and_invalid_fields() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "data": {
+                    "all_total": {"size": None},
+                    "all_use": {"size": "unknown"},
+                    "all_remain": {"size": -1},
+                },
+            },
+        )
+
+    async def run():
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+                pace_webapi=False,
+            )
+            return await client.space_usage()
+        finally:
+            await http_client.aclose()
+
+    usage = asyncio.run(run())
+
+    assert (usage.total_bytes, usage.used_bytes, usage.free_bytes) == (None, None, None)
+
+
 def test_direct_url_issuance_binds_the_requested_user_agent(monkeypatch) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["user-agent"] == "bound-player-ua"

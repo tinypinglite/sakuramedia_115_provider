@@ -137,6 +137,13 @@ class Cloud115RapidUploadResult:
     entry: Cloud115Entry | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Cloud115SpaceUsage:
+    total_bytes: int | None
+    used_bytes: int | None
+    free_bytes: int | None
+
+
 @dataclass
 class TransferState:
     userkeys: dict[str, str] = field(default_factory=dict)
@@ -446,6 +453,18 @@ class Cloud115Client:
         if not isinstance(payload, dict) or "state" not in payload:
             raise Cloud115RequestError("115 登录状态探测返回无效数据")
         return payload["state"] is True
+
+    async def space_usage(self) -> Cloud115SpaceUsage:
+        """查询账号级空间用量；媒体库共享同一账号空间。"""
+        payload = await self._json("GET", "https://webapi.115.com/user/space")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise Cloud115RequestError("115 空间数据无效")
+        return Cloud115SpaceUsage(
+            total_bytes=_space_size(data.get("all_total")),
+            used_bytes=_space_size(data.get("all_use")),
+            free_bytes=_space_size(data.get("all_remain")),
+        )
 
     async def iter_download_nodes(
         self, pickcode: str, *, directories: bool, progress: Callable[[dict[str, Any]], None]
@@ -1165,6 +1184,16 @@ def _as_int(value: object) -> int:
         return int(value) if value is not None else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _space_size(value: object) -> int | None:
+    # /user/space 的 size 是浮点字节数；缺失、非法或负值都按未知处理。
+    if not isinstance(value, dict):
+        return None
+    size = value.get("size")
+    if isinstance(size, bool) or not isinstance(size, (int, float)):
+        return None
+    return int(size) if size >= 0 else None
 
 
 def _first_text(values: dict[str, object], *keys: str) -> str:
