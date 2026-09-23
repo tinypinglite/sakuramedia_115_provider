@@ -75,6 +75,8 @@ THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL = 50
 THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS = 5
 THUMBNAIL_RANGE_REQUEST_DELAY_RANGE = (3.0, 3.0)
 COVER_MAX_FETCHED_BYTES = 64 * 1024 * 1024
+IMPORT_PROBE_MAX_FETCHED_BYTES = 64 * 1024 * 1024
+IMPORT_PROBE_REQUEST_DELAY_RANGE = (1.0, 2.0)
 _HASH_DOMAIN = b"media-file-hash-v1"
 _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
 _HASH_MIDDLE_BYTES = 1024 * 1024
@@ -495,6 +497,53 @@ class Cloud115StorageProvider:
                          self.library.library_id, operation_key, placement.relative_path, type(exc).__name__, safe_error_message(exc))
             raise
 
+    async def _probe_import_video_info(
+        self, client: Cloud115Client, entry: Cloud115Entry
+    ) -> JsonObject | None:
+        try:
+            return await client.get_video_metadata(entry.pickcode)
+        except Cloud115VideoUnavailableError as exc:
+            logger.warning(
+                "115 导入媒体接口不可用，改用原文件 Range 探测 library_id={} source_fid={} reason={}",
+                self.library.library_id,
+                entry.entry_id,
+                safe_error_message(exc),
+            )
+        try:
+            return await self._probe_video_info_from_range(client, entry)
+        except Cloud115Error as exc:
+            logger.warning(
+                "115 导入原文件探测失败 library_id={} source_fid={} error_type={} reason={}",
+                self.library.library_id,
+                entry.entry_id,
+                type(exc).__name__,
+                safe_error_message(exc),
+            )
+            return None
+
+    async def _probe_video_info_from_range(
+        self, client: Cloud115Client, entry: Cloud115Entry
+    ) -> JsonObject | None:
+        direct = await client.get_download_url(
+            entry.pickcode, user_agent=_BROWSER_USER_AGENT
+        )
+        size_bytes = direct.file_size_bytes or entry.size_bytes
+        if size_bytes <= 0:
+            return None
+        reader = Cloud115RangeReader(
+            direct.url,
+            user_agent=direct.user_agent,
+            file_size_bytes=size_bytes,
+            max_fetched_bytes=IMPORT_PROBE_MAX_FETCHED_BYTES,
+            request_delay_range=IMPORT_PROBE_REQUEST_DELAY_RANGE,
+        )
+        try:
+            return await asyncio.to_thread(
+                _read_container_video_info, reader, size_bytes
+            )
+        finally:
+            reader.close()
+
     async def _stage(
         self,
         *,
@@ -510,9 +559,13 @@ class Cloud115StorageProvider:
                     "/".join(placement_parts), source_disposition)
         async with Cloud115Client(self._device_cookie) as client:
             logger.info("115 导入媒体探测开始 operation_dir={} source_fid={}", operation_dir, source_entry.entry_id)
-            video_info = await client.get_video_metadata(source_entry.pickcode)
-            duration_seconds = video_info["container"]["duration_seconds"]
-            resolution = _metadata_resolution(video_info)
+            video_info = await self._probe_import_video_info(client, source_entry)
+            duration_seconds = (
+                video_info["container"]["duration_seconds"]
+                if video_info is not None
+                else None
+            )
+            resolution = _metadata_resolution(video_info) if video_info is not None else None
             logger.info("115 导入媒体探测完成 operation_dir={} duration_seconds={} resolution={}",
                         operation_dir, duration_seconds, resolution)
             target_parent = self._media_root_cid
@@ -1776,6 +1829,46 @@ def _container_duration_seconds(container, video, av) -> int:
         if seconds > 0:
             return seconds
     return 0
+
+
+def _read_container_video_info(
+    reader: Cloud115RangeReader, size_bytes: int
+) -> JsonObject | None:
+    """Read duration and resolution from the source container as an API fallback."""
+    try:
+        import av
+    except ImportError:
+        logger.warning("115 导入原文件探测缺少 PyAV 组件")
+        return None
+    container = None
+    try:
+        container = av.open(reader, mode="r")
+        if not container.streams.video:
+            return None
+        video = container.streams.video[0]
+        duration_seconds = _container_duration_seconds(container, video, av)
+        if duration_seconds <= 0:
+            return None
+        width = int(getattr(video, "width", 0) or 0)
+        height = int(getattr(video, "height", 0) or 0)
+        return {
+            "container": {
+                "size_bytes": size_bytes,
+                "duration_seconds": duration_seconds,
+                "bit_rate": size_bytes * 8 // duration_seconds,
+                "bit_rate_estimated": True,
+            },
+            "video": {"width": width or None, "height": height or None},
+            "audio": None,
+            "subtitles": [],
+        }
+    except Exception as exc:
+        logger.warning("115 导入原文件探测异常 error_type={} reason={}",
+                       type(exc).__name__, safe_error_message(exc))
+        return None
+    finally:
+        if container is not None:
+            container.close()
 
 
 def _is_video(name: str) -> bool:

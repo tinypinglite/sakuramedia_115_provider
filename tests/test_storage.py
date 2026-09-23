@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import ClassVar
@@ -20,6 +21,7 @@ from sakuramedia_115_provider.cloud115 import (
 from sakuramedia_115_provider.exceptions import (
     Cloud115AuthError,
     Cloud115NotFoundError,
+    Cloud115RequestError,
     Cloud115RiskControlError,
     Cloud115VideoUnavailableError,
 )
@@ -58,6 +60,9 @@ class FakeClient:
 
     async def move_files(self, _file_ids, *, parent_cid: str) -> None:
         await self.copy_files([], parent_cid=parent_cid)
+
+    async def get_download_url(self, _pickcode: str, *, user_agent: str):
+        raise AssertionError("direct URL must only be resolved by the range fallback")
 
     async def delete_files(self, _file_ids, *, parent_cid: str | None = None) -> None:
         if parent_cid:
@@ -791,7 +796,161 @@ def test_resolution_probe_treats_missing_api_resolution_as_unknown() -> None:
     ) is None
 
 
-def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
+def test_stage_reads_range_metadata_when_video_api_is_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    reader_calls: list[tuple] = []
+
+    async def ensure(_client, *, parent_cid: str, name: str) -> str:
+        cid = f"{parent_cid}/{name}"
+        FakeClient.entries.setdefault(cid, [])
+        return cid
+
+    async def unavailable(_client, _pickcode):
+        raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
+
+    async def download_url(_client, _pickcode, *, user_agent: str):
+        return Cloud115DirectUrl(
+            "source-fid", "movie.mp4", 99, "sha", "source-pc",
+            "https://cdn.example/movie.mp4", user_agent, 0,
+        )
+
+    class Reader:
+        def __init__(self, url, *, user_agent, file_size_bytes, max_fetched_bytes,
+                     request_delay_range):
+            reader_calls.append((url, user_agent, file_size_bytes, max_fetched_bytes,
+                                 request_delay_range))
+
+        def close(self):
+            reader_calls.append(("close",))
+
+    probe = {
+        "container": {"size_bytes": 99, "duration_seconds": 55,
+                      "bit_rate": 14, "bit_rate_estimated": True},
+        "video": {"width": 3840, "height": 2160},
+        "audio": None,
+        "subtitles": [],
+    }
+
+    def read_container(reader, size_bytes):
+        assert size_bytes == 99
+        return probe
+
+    FakeClient.entries = {}
+    monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
+    monkeypatch.setattr(FakeClient, "get_video_metadata", unavailable)
+    monkeypatch.setattr(FakeClient, "get_download_url", download_url)
+    monkeypatch.setattr(storage, "Cloud115RangeReader", Reader)
+    monkeypatch.setattr(storage, "_read_container_video_info", read_container)
+
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "cookie", "media_root_cid": "media"},
+            "123",
+        ),
+        data_dir=tmp_path,
+    )
+    source = ImportFile(
+        source_ref={
+            "version": 1,
+            "kind": "cloud115_entry",
+            "fid": "source-fid",
+            "parent_cid": "source-parent",
+            "pickcode": "source-pc",
+            "name": "movie.mp4",
+            "size_bytes": 99,
+            "sha1": "sha",
+            "is_dir": False,
+        },
+        name="movie.mp4",
+        relative_path="movie.mp4",
+        size_bytes=99,
+        is_video=True,
+    )
+
+    staged = provider.stage_import_file(
+        source=source,
+        placement=ImportPlacement(relative_path="jav/ABC-001/movie.mp4"),
+        source_disposition="keep",
+        operation_key="import:1",
+    )
+
+    assert staged.storage_ref["pickcode"] == "target-pc"
+    assert staged.video_info == probe
+    assert staged.duration_seconds == 55
+    assert staged.resolution == "3840x2160"
+    assert reader_calls == [
+        ("https://cdn.example/movie.mp4", storage._BROWSER_USER_AGENT, 99,
+         storage.IMPORT_PROBE_MAX_FETCHED_BYTES,
+         storage.IMPORT_PROBE_REQUEST_DELAY_RANGE),
+        ("close",),
+    ]
+
+
+def test_stage_imports_with_unknown_metadata_when_range_probe_fails(
+    monkeypatch, tmp_path
+) -> None:
+    async def ensure(_client, *, parent_cid: str, name: str) -> str:
+        cid = f"{parent_cid}/{name}"
+        FakeClient.entries.setdefault(cid, [])
+        return cid
+
+    async def unavailable(_client, _pickcode):
+        raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
+
+    async def download_failed(_client, _pickcode, *, user_agent: str):
+        raise Cloud115RequestError("115 网络请求失败")
+
+    FakeClient.entries = {}
+    monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
+    monkeypatch.setattr(FakeClient, "get_video_metadata", unavailable)
+    monkeypatch.setattr(FakeClient, "get_download_url", download_failed)
+
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "cookie", "media_root_cid": "media"},
+            "123",
+        ),
+        data_dir=tmp_path,
+    )
+    source = ImportFile(
+        source_ref={
+            "version": 1,
+            "kind": "cloud115_entry",
+            "fid": "source-fid",
+            "parent_cid": "source-parent",
+            "pickcode": "source-pc",
+            "name": "movie.mp4",
+            "size_bytes": 99,
+            "sha1": "sha",
+            "is_dir": False,
+        },
+        name="movie.mp4",
+        relative_path="movie.mp4",
+        size_bytes=99,
+        is_video=True,
+    )
+
+    staged = provider.stage_import_file(
+        source=source,
+        placement=ImportPlacement(relative_path="jav/ABC-001/movie.mp4"),
+        source_disposition="keep",
+        operation_key="import:1",
+    )
+
+    assert staged.storage_ref["pickcode"] == "target-pc"
+    assert staged.video_info is None
+    assert staged.duration_seconds is None
+    assert staged.resolution is None
+
+
+def test_stage_does_not_create_remote_paths_when_video_api_request_fails(
     monkeypatch, tmp_path
 ) -> None:
     created_directories: list[tuple[str, str]] = []
@@ -800,24 +959,23 @@ def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
         created_directories.append((parent_cid, name))
         return f"{parent_cid}/{name}"
 
-    async def unavailable(_client, _pickcode):
-        raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
+    async def request_failed(_client, _pickcode):
+        raise Cloud115RequestError("115 网络请求失败")
 
     FakeClient.entries = {}
     monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
     monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
-    monkeypatch.setattr(
-        FakeClient,
-        "get_video_metadata",
-        unavailable,
+    monkeypatch.setattr(FakeClient, "get_video_metadata", request_failed)
+
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "cookie", "media_root_cid": "media"},
+            "123",
+        ),
+        data_dir=tmp_path,
     )
-    library = LibraryHandle(
-        1,
-        "cloud115",
-        {"device_cookie": "cookie", "media_root_cid": "media"},
-        "123",
-    )
-    provider = storage.Cloud115StorageProvider(library=library, data_dir=tmp_path)
     source = ImportFile(
         source_ref={
             "version": 1,
@@ -847,6 +1005,48 @@ def test_stage_does_not_create_remote_paths_when_duration_probe_fails(
     assert exc_info.value.code == "unavailable"
     assert created_directories == []
     assert FakeClient.entries == {}
+
+
+def test_read_container_video_info_builds_api_shaped_metadata(monkeypatch) -> None:
+    closed: list[bool] = []
+
+    class Video:
+        duration = 55
+        time_base = 1
+        width = 3840
+        height = 2160
+
+    class Container:
+        duration = None
+        streams = SimpleNamespace(video=[Video()])
+
+        def close(self):
+            closed.append(True)
+
+    class AV:
+        time_base = 1_000_000
+
+        @staticmethod
+        def open(_reader, *, mode):
+            assert mode == "r"
+            return Container()
+
+    monkeypatch.setitem(sys.modules, "av", AV)
+
+    info = storage._read_container_video_info(reader=object(), size_bytes=1000)
+
+    assert info == {
+        "container": {
+            "size_bytes": 1000,
+            "duration_seconds": 55,
+            "bit_rate": 1000 * 8 // 55,
+            "bit_rate_estimated": True,
+        },
+        "video": {"width": 3840, "height": 2160},
+        "audio": None,
+        "subtitles": [],
+    }
+    assert closed == [True]
 
 
 class HashClient:
