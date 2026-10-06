@@ -45,6 +45,7 @@ _NOT_FOUND_ERRNOS = {20121, 20125, 990002, 4100003, 4100008}
 _DUPLICATE_NAME_ERRNOS = {20004}
 _M3U8_ATTR = re.compile(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))')
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+DEVICE_APPS = frozenset({"wechatmini", "alipaymini"})
 
 
 class _TransferReader(Protocol):
@@ -1215,8 +1216,10 @@ def _parse_sign_check(value: str, size_bytes: int) -> tuple[int, int]:
     return start, end
 
 
-async def exchange_web_cookie_for_alipaymini(web_cookie: str) -> str:
-    """Use an authenticated web session to create the dedicated R2 cookie."""
+async def exchange_web_cookie_for_device(web_cookie: str, *, device_app: str) -> str:
+    """Use an authenticated web session to create the dedicated device cookie."""
+    if device_app not in DEVICE_APPS:
+        raise ValueError(f"不支持的 115 登录设备: {device_app}")
     async with Cloud115Client(web_cookie) as client:
         if not await client.check_alive():
             raise Cloud115AuthError("115 Web Cookie 已失效")
@@ -1242,7 +1245,7 @@ async def exchange_web_cookie_for_alipaymini(web_cookie: str) -> str:
         await client._json("GET", action_url, params=action_params)
         result = await client._json(
             "POST",
-            "https://qrcodeapi.115.com/app/1.0/alipaymini/1.0/login/qrcode/",
+            f"https://qrcodeapi.115.com/app/1.0/{device_app}/1.0/login/qrcode/",
             data={"account": uid},
         )
         result_data = result.get("data")

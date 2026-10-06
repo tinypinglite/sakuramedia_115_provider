@@ -21,7 +21,7 @@ from sakuramedia_115_provider.cipher import (
 from sakuramedia_115_provider.cloud115 import (
     Cloud115Client,
     choose_hls_definition,
-    exchange_web_cookie_for_alipaymini,
+    exchange_web_cookie_for_device,
 )
 from sakuramedia_115_provider.exceptions import (
     Cloud115AuthError,
@@ -711,7 +711,8 @@ def test_cookie_probe_handles_expired_responses_without_following_redirects() ->
     asyncio.run(check("redirect", False))
 
 
-def test_device_cookie_exchange_uses_prompt_action(monkeypatch) -> None:
+@pytest.mark.parametrize("device_app", ["alipaymini", "wechatmini"])
+def test_device_cookie_exchange_uses_prompt_action(monkeypatch, device_app) -> None:
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
     class FakeClient:
@@ -751,7 +752,9 @@ def test_device_cookie_exchange_uses_prompt_action(monkeypatch) -> None:
 
     monkeypatch.setattr(cloud115, "Cloud115Client", FakeClient)
 
-    device_cookie = asyncio.run(exchange_web_cookie_for_alipaymini("web-cookie"))
+    device_cookie = asyncio.run(
+        exchange_web_cookie_for_device("web-cookie", device_app=device_app)
+    )
 
     assert device_cookie == "UID=device-cookie"
     assert calls[2] == (
@@ -759,6 +762,16 @@ def test_device_cookie_exchange_uses_prompt_action(monkeypatch) -> None:
         "https://qrcodeapi.115.com/api/2.0/slogin.php",
         {"key": "confirm-key", "uid": "login-token", "client": 0},
     )
+    assert calls[3] == (
+        "POST",
+        f"https://qrcodeapi.115.com/app/1.0/{device_app}/1.0/login/qrcode/",
+        {"account": "login-token"},
+    )
+
+
+def test_device_cookie_exchange_rejects_unsupported_app() -> None:
+    with pytest.raises(ValueError):
+        asyncio.run(exchange_web_cookie_for_device("web-cookie", device_app="android"))
 
 
 def test_offline_duplicate_payload_is_distinguished_from_quota() -> None:

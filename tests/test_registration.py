@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from sakuramedia_115_provider.plugin import PLUGIN_ID, register
+
 from src.plugins import PluginContext
 from src.plugins.extensions.media_provider import validate_media_provider_extension
 from src.plugins.provider_protocol import MEDIA_PROVIDER_EXTENSION_KEY
@@ -22,8 +23,14 @@ def test_registration_declares_provider_and_manual_jobs(tmp_path: Path) -> None:
     assert bundle.provider_key == "cloud115"
     assert bundle.playback_deliveries == ("redirect", "proxy")
     fields = {field.key: field for field in bundle.library_config_fields}
-    assert fields["device_cookie"].read_only is True
-    assert fields["device_cookie"].input == "secret"
+    assert fields["web_cookie"].input == "text"
+    assert fields["web_cookie"].required is False
+    assert fields["device_app"].input == "text"
+    assert fields["device_app"].required is False
+    assert fields["device_app"].read_only is False
+    assert fields["device_cookie"].input == "text"
+    assert fields["device_cookie"].required is False
+    assert fields["device_cookie"].read_only is False
     assert bundle.downloads is not None
 
     assert [job.task_key for job in registration.jobs] == [

@@ -43,31 +43,16 @@ class FakeClient:
         return entries[offset : offset + limit], len(entries)
 
 
-def test_prepare_exchanges_web_cookie_and_resolves_configured_roots(
-    monkeypatch, tmp_path: Path
-) -> None:
-    async def exchange(web_cookie: str) -> str:
-        assert web_cookie == "UID=123456_A1_x"
-        return "UID=123456_R2_x"
-
-    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
-    monkeypatch.setattr(plugin, "exchange_web_cookie_for_alipaymini", exchange)
-    bundle = plugin.register(
+def _bundle(tmp_path: Path):
+    return plugin.register(
         PluginContext(plugin_id=plugin.PLUGIN_ID, settings={}, data_dir=tmp_path / "data")
     ).extensions[0].data
 
-    prepared = bundle.prepare_library(
-        submitted_config={
-            "web_cookie": "UID=123456_A1_x",
-            "media_root_path": "/媒体/电影",
-            "downloads_root_path": "/下载/SakuraMedia",
-        },
-        previous=None,
-    )
 
-    assert prepared.account_key == "123456"
-    assert prepared.provider_config == {
+def _previous(**overrides) -> LibraryHandle:
+    config = {
         "web_cookie": "UID=123456_A1_x",
+        "device_app": "alipaymini",
         "device_cookie": "UID=123456_R2_x",
         "account_uid": "123456",
         "media_root_path": "/媒体/电影",
@@ -75,6 +60,151 @@ def test_prepare_exchanges_web_cookie_and_resolves_configured_roots(
         "media_root_cid": "movies",
         "downloads_root_cid": "downloads-root",
     }
+    config.update(overrides)
+    return LibraryHandle(1, "cloud115", config, "123456")
+
+
+def _submitted(**overrides) -> dict:
+    config = {
+        "web_cookie": "UID=123456_A1_x",
+        "media_root_path": "/媒体/电影",
+        "downloads_root_path": "/下载/SakuraMedia",
+    }
+    config.update(overrides)
+    return config
+
+
+def test_prepare_exchanges_web_cookie_and_resolves_configured_roots(
+    monkeypatch, tmp_path: Path
+) -> None:
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        assert web_cookie == "UID=123456_A1_x"
+        assert device_app == "alipaymini"
+        return "UID=123456_R2_x"
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(submitted_config=_submitted(), previous=None)
+
+    assert prepared.account_key == "123456"
+    assert prepared.provider_config == {
+        "web_cookie": "UID=123456_A1_x",
+        "device_app": "alipaymini",
+        "device_cookie": "UID=123456_R2_x",
+        "account_uid": "123456",
+        "media_root_path": "/媒体/电影",
+        "downloads_root_path": "/下载/SakuraMedia",
+        "media_root_cid": "movies",
+        "downloads_root_cid": "downloads-root",
+    }
+
+
+def test_prepare_exchanges_selected_wechatmini_device(monkeypatch, tmp_path: Path) -> None:
+    requested: list[str] = []
+
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        requested.append(device_app)
+        return "UID=123456_R1_x"
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(
+        submitted_config=_submitted(device_app="wechatmini"), previous=None
+    )
+
+    assert requested == ["wechatmini"]
+    assert prepared.provider_config["device_app"] == "wechatmini"
+    assert prepared.provider_config["device_cookie"] == "UID=123456_R1_x"
+
+
+def test_prepare_rejects_unknown_device_app(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    bundle = _bundle(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        bundle.prepare_library(
+            submitted_config=_submitted(device_app="android"), previous=None
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+def test_prepare_uses_pasted_device_cookie_without_web_cookie(
+    monkeypatch, tmp_path: Path
+) -> None:
+    async def exchange(_web_cookie: str, *, device_app: str) -> str:
+        raise AssertionError("手动填写的设备 Cookie 不应触发换取")
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(
+        submitted_config=_submitted(web_cookie="", device_cookie="UID=123456_R2_x"),
+        previous=None,
+    )
+
+    assert prepared.provider_config["web_cookie"] == ""
+    assert prepared.provider_config["device_app"] == "alipaymini"
+    assert prepared.provider_config["device_cookie"] == "UID=123456_R2_x"
+
+
+def test_prepare_rejects_missing_credentials(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    bundle = _bundle(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        bundle.prepare_library(
+            submitted_config=_submitted(web_cookie="", device_cookie=""),
+            previous=None,
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+def test_prepare_reuses_alive_device_cookie(monkeypatch, tmp_path: Path) -> None:
+    async def exchange(_web_cookie: str, *, device_app: str) -> str:
+        raise AssertionError("存活的设备 Cookie 不应触发换取")
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(
+        submitted_config={
+            "media_root_path": "/媒体/电影",
+            "downloads_root_path": "/下载/SakuraMedia",
+        },
+        previous=_previous(device_app="wechatmini", device_cookie="UID=123456_R1_x"),
+    )
+
+    assert prepared.provider_config["web_cookie"] == "UID=123456_A1_x"
+    assert prepared.provider_config["device_cookie"] == "UID=123456_R1_x"
+    assert prepared.provider_config["device_app"] == "wechatmini"
+
+
+def test_prepare_regenerates_when_device_cookie_cleared(monkeypatch, tmp_path: Path) -> None:
+    exchanged: list[str] = []
+
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        exchanged.append(device_app)
+        return "UID=123456_R2_new"
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(
+        submitted_config=_submitted(device_cookie=""),
+        previous=_previous(),
+    )
+
+    assert exchanged == ["alipaymini"]
+    assert prepared.provider_config["device_cookie"] == "UID=123456_R2_new"
 
 
 def test_prepare_replaces_an_expired_reusable_device_cookie(
@@ -90,61 +220,55 @@ def test_prepare_replaces_an_expired_reusable_device_cookie(
 
     exchanged: list[str] = []
 
-    async def exchange(web_cookie: str) -> str:
-        exchanged.append(web_cookie)
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        exchanged.append(device_app)
         return "fresh-device-cookie"
 
     monkeypatch.setattr(plugin, "Cloud115Client", ExpiringClient)
-    monkeypatch.setattr(plugin, "exchange_web_cookie_for_alipaymini", exchange)
-    bundle = plugin.register(
-        PluginContext(plugin_id=plugin.PLUGIN_ID, settings={}, data_dir=tmp_path / "data")
-    ).extensions[0].data
-    previous = LibraryHandle(
-        1,
-        "cloud115",
-        {
-            "web_cookie": "UID=123456_A1_x",
-            "device_cookie": "expired-device-cookie",
-            "account_uid": "123456",
-            "media_root_path": "/媒体/电影",
-            "downloads_root_path": "/下载/SakuraMedia",
-            "media_root_cid": "movies",
-            "downloads_root_cid": "downloads-root",
-        },
-        "123456",
-    )
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
 
     prepared = bundle.prepare_library(
-        submitted_config={
-            "web_cookie": "UID=123456_A1_x",
-            "media_root_path": "/媒体/电影",
-            "downloads_root_path": "/下载/SakuraMedia",
-        },
-        previous=previous,
+        submitted_config=_submitted(),
+        previous=_previous(device_cookie="expired-device-cookie"),
     )
 
-    assert exchanged == ["UID=123456_A1_x"]
+    assert exchanged == ["alipaymini"]
     assert prepared.provider_config["device_cookie"] == "fresh-device-cookie"
 
 
+def test_prepare_switching_device_app_re_exchanges(monkeypatch, tmp_path: Path) -> None:
+    exchanged: list[str] = []
+
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        exchanged.append(device_app)
+        return "UID=123456_R1_x"
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.prepare_library(
+        submitted_config=_submitted(device_app="wechatmini"),
+        previous=_previous(),
+    )
+
+    assert exchanged == ["wechatmini"]
+    assert prepared.provider_config["device_app"] == "wechatmini"
+    assert prepared.provider_config["device_cookie"] == "UID=123456_R1_x"
+
+
 def test_prepare_rejects_missing_configured_directory(monkeypatch, tmp_path: Path) -> None:
-    async def exchange(_web_cookie: str) -> str:
+    async def exchange(_web_cookie: str, *, device_app: str) -> str:
         return "UID=123456_R2_x"
 
     monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
-    monkeypatch.setattr(plugin, "exchange_web_cookie_for_alipaymini", exchange)
-    bundle = plugin.register(
-        PluginContext(plugin_id=plugin.PLUGIN_ID, settings={}, data_dir=tmp_path / "data")
-    ).extensions[0].data
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
 
     with pytest.raises(ProviderOperationError) as error:
         bundle.prepare_library(
-            submitted_config={
-                "web_cookie": "UID=123456_A1_x",
-                "media_root_path": "/不存在",
-                "downloads_root_path": "/下载/SakuraMedia",
-            },
-            previous=None,
+            submitted_config=_submitted(media_root_path="/不存在"), previous=None
         )
 
     assert error.value.code == "invalid_config"
