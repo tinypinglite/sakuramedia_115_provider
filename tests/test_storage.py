@@ -1274,7 +1274,7 @@ def test_thumbnail_generation_falls_back_to_range_when_hls_is_unavailable(
     assert calls["media"] is media
 
 
-def test_generate_range_thumbnails_uses_three_second_delay_and_writes_frames(
+def test_generate_range_thumbnails_writes_frames_without_request_delay(
     monkeypatch, tmp_path
 ) -> None:
     media = replace(_hash_media(99), duration_seconds=25)
@@ -1334,7 +1334,7 @@ def test_generate_range_thumbnails_uses_three_second_delay_and_writes_frames(
         class Resampling:
             LANCZOS = object()
 
-    def range_reader(_media, *, operation, max_fetched_bytes, request_delay_range):
+    def range_reader(_media, *, operation, max_fetched_bytes, request_delay_range=None):
         reader_calls.append((operation, max_fetched_bytes, request_delay_range))
         return Reader()
 
@@ -1358,7 +1358,7 @@ def test_generate_range_thumbnails_uses_three_second_delay_and_writes_frames(
     ]
     assert seeks == [0, 10, 20]
     assert reader_calls == [
-        ("generate_thumbnails", 99, storage.THUMBNAIL_RANGE_REQUEST_DELAY_RANGE),
+        ("generate_thumbnails", 99, None),
         ("close",),
     ]
     assert all((workspace / name).read_bytes() == b"webp" for name in (

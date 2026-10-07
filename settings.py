@@ -7,7 +7,7 @@ class Cloud115ProviderSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     thumbnail_hls_max_workers: int = Field(
-        default=1,
+        default=4,
         ge=1,
         le=16,
         title="缩略图 HLS 分片并发数",

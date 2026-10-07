@@ -5,8 +5,8 @@ from pydantic import ValidationError
 from sakuramedia_115_provider.settings import Cloud115ProviderSettings
 
 
-def test_defaults_to_single_hls_worker() -> None:
-    assert Cloud115ProviderSettings().thumbnail_hls_max_workers == 1
+def test_defaults_to_four_hls_workers() -> None:
+    assert Cloud115ProviderSettings().thumbnail_hls_max_workers == 4
 
 
 @pytest.mark.parametrize("value", [0, 17])
