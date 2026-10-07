@@ -26,7 +26,6 @@ from src.scheduler.contracts import JobDefinition
 from .cleanup import (
     CleanupConfirmParams,
     cleanup_empty_media_dirs,
-    cleanup_imported_downloads,
 )
 from .cloud115 import (
     DEVICE_APPS,
@@ -264,15 +263,6 @@ def register(context: PluginContext) -> PluginRegistration:
         version=VERSION,
         host_api_version=HOST_API_VERSION,
         jobs=(
-            JobDefinition(
-                task_key="sakuramedia_115_cleanup_imported_downloads",
-                log_name="115-cleanup-imported-downloads",
-                cli_name="115-cleanup-imported-downloads",
-                cli_help="删除已导入的115离线下载任务目录",
-                manual_only=True,
-                params_schema=CleanupConfirmParams,
-                handler=cleanup_imported_downloads,
-            ),
             JobDefinition(
                 task_key="sakuramedia_115_cleanup_empty_media_dirs",
                 log_name="115-cleanup-empty-media-dirs",

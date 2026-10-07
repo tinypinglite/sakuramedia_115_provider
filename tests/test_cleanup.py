@@ -39,7 +39,6 @@ class TreeClient:
     def __init__(self):
         self.tree = {}
         self.files = {}
-        self.tasks = ()
         self.deleted = []
 
     async def __aenter__(self):
@@ -64,9 +63,6 @@ class TreeClient:
         for entry in self.files[cid]:
             yield entry
 
-    async def list_offline_tasks(self, *, page):
-        return self.tasks, 1
-
     async def delete_files(self, ids, *, parent_cid):
         self.deleted.append((ids, parent_cid))
 
@@ -79,58 +75,11 @@ def client(monkeypatch):
         provider_config={
             "device_cookie": "cookie",
             "media_root_cid": "root",
-            "downloads_root_cid": "root",
         },
     )
     monkeypatch.setattr(cleanup, "Cloud115Client", lambda *args, **kwargs: client)
     monkeypatch.setattr(cleanup, "_load_media_libraries", lambda: (library,))
-    monkeypatch.setattr(
-        cleanup, "_load_imported_media_groups", lambda: {1: (library, {SHA1: {100}})}
-    )
-    monkeypatch.setattr(cleanup, "_minimum_video_size_bytes", lambda: 100)
     return client
-
-
-def test_download_cleanup_deletes_imported_copies_and_preserves_unsafe_sources(
-    client, log_messages
-):
-    ids = ("imported", "copy", "unmatched", "active", "completed", "wrong-size")
-    client.tree["root"] = tuple(directory(cid) for cid in ids)
-    client.files["root"] = (
-        video("nested"),
-        video("nested", sha1=None, size=1),
-        video("copy"),
-        video("unmatched"),
-        video("unmatched", sha1="B" * 40),
-        video("active"),
-        video("completed"),
-        video("wrong-size", size=101),
-    )
-    client.tree["imported"] = (directory("nested", "imported"),)
-    client.tasks = (
-        SimpleNamespace(save_dir_id="active", status=1),
-        SimpleNamespace(save_dir_id="completed", status=2),
-    )
-
-    reporter = Reporter()
-    result = cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
-
-    assert result["skipped_offline_directories"] == 2
-    assert result["skipped_unimported_video_directories"] == 1
-    assert result["skipped_unmatched_directories"] == 1
-    assert result["skipped_directories"] == 4
-    assert "result_text" not in result
-    assert result["elapsed_seconds"] >= 0
-    assert any(e["text"].endswith("核对目录归属：0/6") for e in reporter.events)
-    assert any(e["text"].endswith("核对目录归属：6/6") for e in reporter.events)
-    assert any(e["text"].endswith("删除目录：2/2") for e in reporter.events)
-    assert reporter.summary == result
-    assert any(
-        "已删除目录" in message and "task-imported" in message
-        for message in log_messages
-    )
-    assert any("reason=仍关联离线任务" in message for message in log_messages)
-    assert client.deleted == [(["imported", "copy"], "root")]
 
 
 def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(client, log_messages):
@@ -164,10 +113,7 @@ def test_empty_cleanup_preserves_files_and_root_and_rechecks_nested_writes(clien
     assert any("已删除目录" in message and "cid=outer" in message and "path=/task-outer" in message for message in log_messages)
 
 
-@pytest.mark.parametrize(
-    "handler", [cleanup.cleanup_empty_media_dirs, cleanup.cleanup_imported_downloads]
-)
-def test_cleanup_preserves_counts_when_second_batch_fails(client, monkeypatch, handler):
+def test_cleanup_preserves_counts_when_second_batch_fails(client, monkeypatch):
     client.tree = {"root": (directory("a"), directory("b")), "a": (), "b": ()}
     client.files = {"root": (video("a"), video("b")), "a": (), "b": ()}
     delete_files = client.delete_files
@@ -181,38 +127,26 @@ def test_cleanup_preserves_counts_when_second_batch_fails(client, monkeypatch, h
     monkeypatch.setattr(cleanup, "DELETE_BATCH_SIZE", 1)
 
     reporter = Reporter()
-    if handler is cleanup.cleanup_imported_downloads:
-        with pytest.raises(cleanup.Cloud115Error, match="deleted_directories.*1"):
-            handler(reporter, {"confirm": True})
-        result = reporter.summary
-    else:
-        result = handler(reporter, {"confirm": True})
+    result = cleanup.cleanup_empty_media_dirs(reporter, {"confirm": True})
 
     assert client.deleted == [(["a"], "root")]
     assert result["deleted_directories"] == 1
     assert result["failed_libraries"] == 1
 
 
-@pytest.mark.parametrize(
-    "handler", [cleanup.cleanup_empty_media_dirs, cleanup.cleanup_imported_downloads]
-)
 @pytest.mark.parametrize("params", [{}, {"confirm": False}])
-def test_cleanup_requires_confirmation_before_accessing_data(
-    monkeypatch, handler, params
-):
+def test_cleanup_requires_confirmation_before_accessing_data(monkeypatch, params):
     def unexpected_access():
         pytest.fail("未确认时不应读取清理数据")
 
     monkeypatch.setattr(cleanup, "_load_media_libraries", unexpected_access)
-    monkeypatch.setattr(cleanup, "_load_imported_media_groups", unexpected_access)
 
     with pytest.raises(ValueError):
-        handler(None, params)
+        cleanup.cleanup_empty_media_dirs(None, params)
 
 
-def test_cleanup_reports_directory_stage_before_waiting_for_115(client, monkeypatch):
+def test_empty_cleanup_reports_directory_stage_before_waiting_for_115(client, monkeypatch):
     client.tree["root"] = (directory("a"),)
-    client.files["root"] = (video("nested"),)
     reporter = Reporter()
 
     async def fail_directory_info(cid):
@@ -220,10 +154,9 @@ def test_cleanup_reports_directory_stage_before_waiting_for_115(client, monkeypa
         raise cleanup.Cloud115Error("115 unavailable")
 
     monkeypatch.setattr(client, "file_by_id", fail_directory_info)
-    with pytest.raises(cleanup.Cloud115Error, match="cleanup failed"):
-        cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
+    result = cleanup.cleanup_empty_media_dirs(reporter, {"confirm": True})
     assert not client.deleted
-    assert reporter.summary["failed_libraries"] == 1
+    assert result["failed_libraries"] == 1
 
 
 def test_cleanup_throttles_progress_and_restores_stage_after_wait(
@@ -246,27 +179,6 @@ def test_cleanup_throttles_progress_and_restores_stage_after_wait(
     assert reporter.events[-1]["text"] == "核对目录归属：11/100"
     progress({"text": "读取目录", "current": 0, "total": 0})
     assert reporter.events[-1]["total"] == 0
-
-
-def test_cleanup_continues_other_libraries_after_failure(client, monkeypatch):
-    valid = cleanup._load_media_libraries()[0]
-    invalid = SimpleNamespace(id=2, provider_config={})
-    monkeypatch.setattr(
-        cleanup,
-        "_load_imported_media_groups",
-        lambda: {
-            2: (invalid, {SHA1: {100}}),
-            1: (valid, {SHA1: {100}}),
-        },
-    )
-    client.tree["root"] = (directory("a"),)
-    client.files["root"] = (video("a"),)
-    reporter = Reporter()
-    with pytest.raises(cleanup.Cloud115Error, match="failed_libraries.*1"):
-        cleanup.cleanup_imported_downloads(reporter, {"confirm": True})
-    assert client.deleted == [(["a"], "root")]
-    assert reporter.summary["deleted_directories"] == 1
-    assert reporter.summary["libraries"] == 2
 
 
 @pytest.mark.parametrize("invalid", ["orphan", "cycle", "unknown_file_parent"])

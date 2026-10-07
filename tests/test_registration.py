@@ -34,7 +34,6 @@ def test_registration_declares_provider_and_manual_jobs(tmp_path: Path) -> None:
     assert bundle.downloads is not None
 
     assert [job.task_key for job in registration.jobs] == [
-        "sakuramedia_115_cleanup_imported_downloads",
         "sakuramedia_115_cleanup_empty_media_dirs",
     ]
     assert all(job.manual_only for job in registration.jobs)
