@@ -40,6 +40,7 @@ from .exceptions import (
     safe_error_message,
 )
 from .offline import Cloud115OfflineDownloadComponent
+from .settings import Cloud115ProviderSettings
 
 PLUGIN_ID = "sakuramedia_115_provider"
 DISPLAY_NAME = "115 网盘"
@@ -121,8 +122,9 @@ class Cloud115MediaProviderBundle:
     playback_deliveries = ("redirect", "proxy")
     merged_playback_format = "hls"
 
-    def __init__(self, *, data_dir: Path) -> None:
+    def __init__(self, *, data_dir: Path, settings: Cloud115ProviderSettings) -> None:
         self.data_dir = data_dir
+        self._settings = settings
         self.downloads = Cloud115OfflineDownloadComponent()
 
     def prepare_library(
@@ -251,11 +253,16 @@ class Cloud115MediaProviderBundle:
     def build_storage(self, *, library: LibraryHandle):
         from .storage import Cloud115StorageProvider
 
-        return Cloud115StorageProvider(library=library, data_dir=self.data_dir)
+        return Cloud115StorageProvider(
+            library=library,
+            data_dir=self.data_dir,
+            hls_max_workers=self._settings.thumbnail_hls_max_workers,
+        )
 
 
 def register(context: PluginContext) -> PluginRegistration:
-    bundle = Cloud115MediaProviderBundle(data_dir=context.data_dir)
+    settings = Cloud115ProviderSettings.model_validate(context.settings)
+    bundle = Cloud115MediaProviderBundle(data_dir=context.data_dir, settings=settings)
 
     return PluginRegistration(
         plugin_id=PLUGIN_ID,

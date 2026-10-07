@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import ClassVar
@@ -1217,6 +1218,33 @@ def test_thumbnail_generation_reports_target_lookup_and_generated_counts(monkeyp
     assert "已生成 0/2 张" in progress[1]
     assert "已生成 2/2 张" in progress[-1]
     assert "分片 1/1" in progress[-1]
+
+
+def test_thumbnail_generation_uses_configured_hls_workers(monkeypatch, tmp_path) -> None:
+    media = _hash_media(10)
+    provider = storage.Cloud115StorageProvider(
+        library=media.library, data_dir=tmp_path, hls_max_workers=4
+    )
+    recorded: list[int | None] = []
+
+    class RecordingPool(ThreadPoolExecutor):
+        def __init__(self, max_workers=None, **kwargs) -> None:
+            recorded.append(max_workers)
+            super().__init__(max_workers=max_workers, **kwargs)
+
+    async def targets(_media):
+        return [(SimpleNamespace(index=0), [0])], 1
+
+    monkeypatch.setattr(provider, "_thumbnail_targets", targets)
+    monkeypatch.setattr(provider, "_decode_hls_segment", lambda **_kwargs: [])
+    monkeypatch.setattr(storage, "ThreadPoolExecutor", RecordingPool)
+
+    generation = provider.generate_thumbnails(
+        media=media, workspace=tmp_path / "thumbnails"
+    )
+
+    assert recorded == [4]
+    assert generation.expected_count == 1
 
 
 def test_thumbnail_generation_falls_back_to_range_when_hls_is_unavailable(

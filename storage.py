@@ -142,7 +142,13 @@ def _staged_media(
 
 
 class Cloud115StorageProvider:
-    def __init__(self, *, library: LibraryHandle, data_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        library: LibraryHandle,
+        data_dir: Path,
+        hls_max_workers: int = THUMBNAIL_HLS_MAX_WORKERS,
+    ) -> None:
         config = library.provider_config
         if not isinstance(config, dict):
             raise _error("build_storage", "invalid_config", "115 媒体库配置无效")
@@ -154,6 +160,7 @@ class Cloud115StorageProvider:
         self._device_cookie = cookie
         self._media_root_cid = media_root
         self.data_dir = data_dir
+        self._hls_max_workers = hls_max_workers
         self._playback = Cloud115Playback(device_cookie=cookie)
         self._transfer_state = TransferState()
         self._transfer_directories: dict[str, dict[str, str]] = {}
@@ -1235,7 +1242,7 @@ class Cloud115StorageProvider:
             )
 
         artifacts: list[ThumbnailArtifact] = []
-        with ThreadPoolExecutor(max_workers=THUMBNAIL_HLS_MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=self._hls_max_workers) as executor:
             futures = {
                 executor.submit(
                     self._decode_hls_segment,

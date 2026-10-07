@@ -74,6 +74,21 @@ def _submitted(**overrides) -> dict:
     return config
 
 
+def test_register_passes_configured_thumbnail_workers_to_storage(tmp_path: Path) -> None:
+    registration = plugin.register(
+        PluginContext(
+            plugin_id=plugin.PLUGIN_ID,
+            settings={"thumbnail_hls_max_workers": 6},
+            data_dir=tmp_path / "data",
+        )
+    )
+    bundle = registration.extensions[0].data
+
+    provider = bundle.build_storage(library=_previous())
+
+    assert provider._hls_max_workers == 6
+
+
 def test_prepare_exchanges_web_cookie_and_resolves_configured_roots(
     monkeypatch, tmp_path: Path
 ) -> None:
