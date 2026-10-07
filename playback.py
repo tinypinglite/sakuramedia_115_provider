@@ -68,7 +68,8 @@ _RELAY_HEADERS = frozenset(
 class _DirectEntry:
     direct: Cloud115DirectUrl
     usable_until: float
-    slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
+    # 115 直链实测每 URL 并发配额 2：同时 3 个以上 Range 会被瞬时 403 拒绝（非封禁）。
+    slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
 
 
 @dataclass(slots=True)

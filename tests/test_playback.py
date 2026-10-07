@@ -169,6 +169,32 @@ def test_external_relay_releases_lease_when_connect_is_cancelled(monkeypatch) ->
     assert closed == [True]
 
 
+def test_direct_entry_limits_upstream_range_concurrency_to_two() -> None:
+    entry = playback._DirectEntry(
+        direct=Cloud115DirectUrl(
+            file_id="1",
+            file_name="a.mp4",
+            file_size_bytes=1,
+            sha1="",
+            pickcode="pc",
+            url="https://direct/file",
+            user_agent="ua",
+            expires_at=0,
+        ),
+        usable_until=0.0,
+    )
+
+    async def probe() -> bool:
+        await entry.slots.acquire()
+        await entry.slots.acquire()
+        locked = entry.slots.locked()
+        entry.slots.release()
+        entry.slots.release()
+        return locked
+
+    assert asyncio.run(probe()) is True
+
+
 def test_hls_relay_ignores_range_and_rejects_partial_segments(monkeypatch) -> None:
     seen_ranges: list[str | None] = []
     status_code = 200
