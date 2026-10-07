@@ -37,7 +37,53 @@ OFFLINE_REF_VERSION = 1
 OFFLINE_SOURCE_KIND = "cloud115_dir"
 _BTIH_RE = re.compile(r"urn:btih:([A-Za-z0-9]+)", re.IGNORECASE)
 _INFO_HASH_DIR_RE = re.compile(r"^[0-9a-f]{40}$")
+_MANAGED_DISPLAY_DIR_RE = re.compile(r"^.+-(?P<suffix>[0-9a-f]{6})$")
 MAX_HTTP_REDIRECTS = 5
+
+
+def _safe_dir_name(value: object) -> str | None:
+    """与 qB 相同的目录名清洗规则；清洗后无有效内容时返回 None。"""
+    if not isinstance(value, str):
+        return None
+    name = " ".join(value.replace("\x00", " ").replace("/", " ").replace("\\", " ").split())
+    if not name or name in {".", ".."}:
+        return None
+    return name
+
+
+def _is_managed_dir_name(name: str) -> bool:
+    """托管下载目录：本插件创建的 `task-*`、旧 `info_hash`、新 `<番号>-<hash6>`。"""
+    if not isinstance(name, str) or not name:
+        return False
+    return (
+        name.startswith("task-")
+        or _INFO_HASH_DIR_RE.fullmatch(name) is not None
+        or _MANAGED_DISPLAY_DIR_RE.fullmatch(name) is not None
+    )
+
+
+def _leftover_task_dir_id(entries, info_hash: str) -> str | None:
+    """任务已从 115 列表消失时，按目录命名兜底定位残留目录。
+
+    只认目录名等于 info_hash 或以 `-<hash 前 6 位>` 结尾的候选；多个命中
+    （极端哈希前缀碰撞）时放弃，避免误删。
+    """
+    suffix = f"-{info_hash[:6].lower()}"
+    matches = [
+        entry.entry_id
+        for entry in entries
+        if entry.is_dir
+        and (entry.name == info_hash or entry.name.lower().endswith(suffix))
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning(
+            "115 下载目录兜底匹配到多个候选，跳过 info_hash={} candidates={}",
+            info_hash,
+            matches,
+        )
+    return None
 
 
 def _canonical_btih(value: str) -> str:
@@ -129,11 +175,18 @@ def _resolve_source(source_uri: str) -> tuple[str, str]:
     return f"magnet:?xt=urn:btih:{info_hash}", info_hash
 
 
-async def _create_task_dir(client: Cloud115Client, *, parent_cid: str, info_hash: str) -> str:
+async def _create_task_dir(
+    client: Cloud115Client,
+    *,
+    parent_cid: str,
+    display_name: object,
+    info_hash: str,
+) -> str:
+    name = _safe_dir_name(display_name) or info_hash
     try:
-        return await client.mkdir(parent_cid, info_hash)
+        return await client.mkdir(parent_cid, name)
     except Cloud115DuplicateNameError:
-        return await find_or_create_subdir(client, parent_cid=parent_cid, name=info_hash)
+        return await find_or_create_subdir(client, parent_cid=parent_cid, name=name)
 
 
 async def _find_offline_task(client: Cloud115Client, *, info_hash: str):
@@ -226,6 +279,7 @@ class Cloud115OfflineDownloadProvider:
                 directory = await _create_task_dir(
                     client,
                     parent_cid=self._downloads_root_cid,
+                    display_name=submission.display_name,
                     info_hash=info_hash,
                 )
                 logger.info("115 离线下载保存目录已就绪 info_hash={} save_dir_cid={}", info_hash, directory)
@@ -237,7 +291,7 @@ class Cloud115OfflineDownloadProvider:
                         managed_dirs = {
                             entry.entry_id
                             for entry in await client.list_directory(self._downloads_root_cid)
-                            if entry.is_dir
+                            if entry.is_dir and _is_managed_dir_name(entry.name)
                         }
                         if existing.save_dir_id in managed_dirs:
                             logger.info("115 离线下载接管已有任务 info_hash={} save_dir_cid={}", info_hash, existing.save_dir_id)
@@ -275,7 +329,7 @@ class Cloud115OfflineDownloadProvider:
                     entry.entry_id
                     for entry in await client.list_directory(self._downloads_root_cid)
                     if entry.is_dir
-                    and (entry.name.startswith("task-") or _INFO_HASH_DIR_RE.fullmatch(entry.name))
+                    and _is_managed_dir_name(entry.name)
                 }
                 page = 1
                 results: list[RemoteDownloadTask] = []
@@ -319,12 +373,59 @@ class Cloud115OfflineDownloadProvider:
             raise _cloud_error("list_downloads", exc) from exc
 
     def delete_task(self, *, remote_id: str, delete_files: bool) -> None:
-        if not isinstance(remote_id, str) or not remote_id:
+        if not isinstance(remote_id, str) or not remote_id.strip():
             raise _error("delete_download", "invalid_config", "115 离线任务 ID 无效")
+        remote_id = remote_id.strip()
 
         async def delete() -> None:
             async with Cloud115Client(self._device_cookie) as client:
-                await client.delete_offline_task(remote_id, delete_files=delete_files)
+                directory_id = None
+                if delete_files:
+                    try:
+                        task = await _find_offline_task(client, info_hash=remote_id)
+                        entries = await client.list_directory(self._downloads_root_cid)
+                    except Cloud115Error as exc:
+                        logger.warning(
+                            "115 下载目录定位失败 remote_id={} error_type={} reason={}",
+                            remote_id,
+                            type(exc).__name__,
+                            safe_error_message(exc),
+                        )
+                    else:
+                        if task is None:
+                            # 任务已不在 115 列表：按命名约定兜底找残留目录。
+                            directory_id = _leftover_task_dir_id(entries, remote_id)
+                        else:
+                            managed_ids = {
+                                entry.entry_id
+                                for entry in entries
+                                if entry.is_dir and _is_managed_dir_name(entry.name)
+                            }
+                            if task.save_dir_id in managed_ids:
+                                directory_id = task.save_dir_id
+                try:
+                    await client.delete_offline_task(remote_id, delete_files=delete_files)
+                except Cloud115NotFoundError:
+                    logger.info("115 离线任务已不存在 remote_id={}", remote_id)
+                if delete_files and directory_id is not None:
+                    try:
+                        await client.delete_files(
+                            [directory_id], parent_cid=self._downloads_root_cid
+                        )
+                        logger.info(
+                            "115 下载目录已删除 remote_id={} save_dir_cid={}",
+                            remote_id,
+                            directory_id,
+                        )
+                    except Cloud115Error as exc:
+                        # 尽力而为：任务已删成功，目录清理失败只告警，不阻塞宿主台账。
+                        logger.warning(
+                            "115 下载目录清理失败 remote_id={} save_dir_cid={} error_type={} reason={}",
+                            remote_id,
+                            directory_id,
+                            type(exc).__name__,
+                            safe_error_message(exc),
+                        )
 
         logger.info("115 离线任务删除开始 remote_id={} delete_files={}", remote_id, delete_files)
         try:
