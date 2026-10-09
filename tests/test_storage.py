@@ -709,6 +709,56 @@ def test_stage_copy_returns_remote_media_ref_and_abort_removes_copy(monkeypatch,
     assert FakeClient.entries[target_dir] == []
 
 
+def test_stage_copy_matches_file_renamed_to_lowercase_extension(monkeypatch, tmp_path) -> None:
+    """115 复制会规范扩展名大小写（ABP-646-A.MP4 -> ABP-646-A.mp4），暂存校验要能命中。"""
+
+    async def ensure(_client, *, parent_cid: str, name: str) -> str:
+        cid = f"{parent_cid}/{name}"
+        FakeClient.entries.setdefault(cid, [])
+        return cid
+
+    FakeClient.entries = {}
+    monkeypatch.setattr(storage, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", ensure)
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "cookie", "media_root_cid": "media"},
+            "123",
+        ),
+        data_dir=tmp_path,
+    )
+    source = ImportFile(
+        source_ref={
+            "version": 1,
+            "kind": "cloud115_entry",
+            "fid": "source-fid",
+            "parent_cid": "source-parent",
+            "pickcode": "source-pc",
+            "name": "MOVIE.MP4",
+            "size_bytes": 99,
+            "sha1": "sha",
+            "is_dir": False,
+        },
+        name="MOVIE.MP4",
+        relative_path="MOVIE.MP4",
+        size_bytes=99,
+        is_video=True,
+    )
+
+    staged = provider.stage_import_file(
+        source=source,
+        placement=ImportPlacement(relative_path="jav/ABC-001/MOVIE.MP4"),
+        source_disposition="keep",
+        operation_key="import:1",
+    )
+
+    assert staged.storage_ref["kind"] == "cloud115_media"
+    assert staged.storage_ref["pickcode"] == "target-pc"
+    assert staged.storage_ref["name"] == "movie.mp4"
+
+
 def test_stage_supports_legacy_staged_media_contract(monkeypatch, tmp_path) -> None:
     @dataclass
     class LegacyStagedMedia:

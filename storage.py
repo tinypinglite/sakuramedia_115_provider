@@ -582,10 +582,11 @@ class Cloud115StorageProvider:
             target_dir = await self._directory(
                 client, target_parent, operation_dir, directory_cache
             )
+            # 115 复制后会规范扩展名大小写（ABP-646-A.MP4 -> ABP-646-A.mp4），复用判断按大小写不敏感。
             existing = tuple(
                 entry
                 for entry in await client.list_directory(target_dir)
-                if not entry.is_dir and entry.name == source_entry.name
+                if not entry.is_dir and entry.name.casefold() == source_entry.name.casefold()
             )
             if existing:
                 target_entry = existing[0]
@@ -1756,11 +1757,13 @@ def _transfer_receipt(receipt: object, *, operation: str) -> dict[str, Any]:
 def _find_staged_entry(
     entries: tuple[Cloud115Entry, ...], source: Cloud115Entry
 ) -> Cloud115Entry:
+    # 115 复制后会规范扩展名大小写（ABP-646-A.MP4 -> ABP-646-A.mp4），
+    # 名称按大小写不敏感比较，内容仍由 sha1 校验。
     matches = [
         entry
         for entry in entries
         if not entry.is_dir
-        and entry.name == source.name
+        and entry.name.casefold() == source.name.casefold()
         and (not source.sha1 or entry.sha1 == source.sha1)
     ]
     if len(matches) != 1:
