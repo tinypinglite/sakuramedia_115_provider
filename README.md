@@ -6,6 +6,18 @@
 
 在 SakuraMedia 的「系统设置 → 插件」点击「安装插件」，上传本插件的 `.zip` 包；安装后确认插件已启用，再重启 SakuraMedia 容器。插件的安装、启停、删除或插件配置修改后，前端都会提示需要重启容器才生效。
 
+## 获取 115 Web Cookie
+
+插件通过 115 网页端 Cookie 登录，只需获取一次。
+
+1. 用浏览器登录 <https://115.com>。
+2. 按 F12 打开开发者工具，切换到「网络 / Network」并刷新页面，点开任意一个发往 `115.com` 的请求。
+3. 在「标头 / Headers」→「请求标头 / Request Headers」中找到 `Cookie:`，复制冒号后的整段内容。
+   也可以在「应用 / Application」→「Cookie」→ `https://115.com` 中复制 `UID`、`CID`、`SEID`、`KID`（有 `acw_tc` 也一并复制），按 `key=value; key=value` 的格式拼成一行。
+4. 粘贴到「115 Web Cookie」，保存时会自动换取独立设备登录，通常不需要再填「115 专用设备 Cookie」。
+
+> Cookie 等同于账号权限，不要发到 issue、日志或截图里。插件只会保留 `UID`、`CID`、`SEID`、`KID`、`acw_tc`，其余 Cookie 会被忽略；Cookie 失效后，编辑媒体库重新获取并保存即可。
+
 ## 创建媒体库
 
 在「系统设置 → 媒体库」点击「新增媒体库」，将「存储 Provider」设为「115 网盘」，再填写：
