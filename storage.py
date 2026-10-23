@@ -223,6 +223,73 @@ class Cloud115StorageProvider:
         except ValueError as exc:
             raise _error("scan_import_source", "source_not_found", "115 导入源无效") from exc
 
+    def validate_import_source(
+        self, *, source_ref: JsonObject, source_disposition: str
+    ) -> None:
+        operation = "validate_import_source"
+        if not isinstance(source_ref, dict):
+            raise _error(operation, "source_not_found", "115 导入源无效")
+        kind = source_ref.get("kind")
+        if source_ref.get("version") != REF_VERSION or kind not in {
+            DIR_REF_KIND,
+            ENTRY_REF_KIND,
+        }:
+            raise _error(operation, "source_not_found", "115 导入源无效")
+        media_root = self._media_root_cid
+        if media_root == "0":
+            raise self._overlap_error()
+        if kind == ENTRY_REF_KIND:
+            entry = _entry_ref(source_ref, operation=operation)
+            if entry.is_dir:
+                raise _error(operation, "source_not_found", "115 导入源无效")
+            parent_cid = entry.parent_id
+            if not parent_cid:
+                raise _error(operation, "source_not_found", "115 导入源无效")
+            if parent_cid == media_root or media_root in self._ancestor_cids(parent_cid):
+                raise self._overlap_error()
+            return
+        cid = _directory_ref(source_ref, operation=operation)
+        if cid == "0":
+            raise self._overlap_error()
+        if cid == media_root or media_root in self._ancestor_cids(cid):
+            raise self._overlap_error()
+        if cid in self._ancestor_cids(media_root):
+            raise self._overlap_error()
+
+    def _ancestor_cids(self, cid: str) -> frozenset[str]:
+        if cid == "0":
+            return frozenset()
+
+        async def load():
+            async with Cloud115Client(self._device_cookie) as client:
+                return await client.directory_info(cid)
+
+        try:
+            info = run_sync(load())
+        except Cloud115Error as exc:
+            logger.warning(
+                "115 操作失败 library_id={} operation={} cid={} error_type={} reason={}",
+                self.library.library_id,
+                "validate_import_source",
+                cid,
+                type(exc).__name__,
+                safe_error_message(exc),
+            )
+            raise _cloud_error("validate_import_source", exc) from exc
+        except ValueError as exc:
+            raise _error(
+                "validate_import_source", "source_not_found", "115 导入源无效"
+            ) from exc
+        return frozenset(ancestor_cid for ancestor_cid, _name in info.ancestors)
+
+    @staticmethod
+    def _overlap_error() -> ProviderOperationError:
+        return _error(
+            "validate_import_source",
+            "invalid_config",
+            "115 导入源与媒体库目录重叠，请选择媒体库目录之外的位置",
+        )
+
     def get_import_source_identity(self, *, source: ImportFile) -> str | None:
         entry = _entry_ref(source.source_ref, operation="get_import_source_identity")
         if entry.is_dir:

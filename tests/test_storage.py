@@ -1766,3 +1766,186 @@ def test_video_info_unavailable_keeps_missing_value(monkeypatch, tmp_path):
     provider = _scan_provider(tmp_path)
     media = MediaHandle(1, provider.library, storage._media_ref(entry), "movie.mp4", 99, 0)
     assert provider.probe_video_info(media=media) is None
+
+
+def _dir_source_ref(cid: str) -> dict:
+    return {"version": 1, "kind": "cloud115_dir", "cid": cid}
+
+
+def _entry_source_ref(parent_cid: str, *, is_dir: bool = False) -> dict:
+    return {
+        "version": 1,
+        "kind": "cloud115_entry",
+        "fid": "file-fid",
+        "parent_cid": parent_cid,
+        "pickcode": "file-pc",
+        "name": "movie.mp4",
+        "size_bytes": 99,
+        "sha1": "file-sha",
+        "is_dir": is_dir,
+    }
+
+
+def _directory_info(*ancestor_cids: str) -> Cloud115DirectoryInfo:
+    return Cloud115DirectoryInfo(
+        name="directory",
+        ancestors=tuple((cid, cid) for cid in ancestor_cids),
+    )
+
+
+@pytest.mark.parametrize(
+    "source_disposition", ["keep", "delete_after_commit", "in_place"]
+)
+def test_validate_import_source_rejects_media_root(
+    monkeypatch, tmp_path, source_disposition
+) -> None:
+    ScanClient.directory_info_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref=_dir_source_ref("media"),
+            source_disposition=source_disposition,
+        )
+
+    assert error.value.code == "invalid_config"
+    assert ScanClient.directory_info_calls == []
+
+
+def test_validate_import_source_rejects_descendant_of_media_root(
+    monkeypatch, tmp_path
+) -> None:
+    ScanClient.directory_info_calls = []
+    ScanClient.directory_infos = {"child": _directory_info("0", "media")}
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref=_dir_source_ref("child"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert ScanClient.directory_info_calls == ["child"]
+
+
+def test_validate_import_source_rejects_account_root(monkeypatch, tmp_path) -> None:
+    ScanClient.directory_info_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref=_dir_source_ref("0"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+    assert ScanClient.directory_info_calls == []
+
+
+def test_validate_import_source_allows_disjoint_directory(
+    monkeypatch, tmp_path
+) -> None:
+    ScanClient.directory_info_calls = []
+    ScanClient.directory_infos = {
+        "downloads": _directory_info("0"),
+        "media": _directory_info("0"),
+    }
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    _scan_provider(tmp_path).validate_import_source(
+        source_ref=_dir_source_ref("downloads"),
+        source_disposition="keep",
+    )
+
+    assert ScanClient.directory_info_calls == ["downloads", "media"]
+
+
+def test_validate_import_source_entry_checks_parent_directory(
+    monkeypatch, tmp_path
+) -> None:
+    ScanClient.directory_info_calls = []
+    ScanClient.directory_infos = {
+        "inside": _directory_info("0", "media"),
+        "downloads": _directory_info("0"),
+    }
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+    provider = _scan_provider(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_entry_source_ref("inside"),
+            source_disposition="keep",
+        )
+    assert error.value.code == "invalid_config"
+
+    provider.validate_import_source(
+        source_ref=_entry_source_ref("downloads"),
+        source_disposition="keep",
+    )
+
+
+def test_validate_import_source_rejects_directory_entry_ref(
+    monkeypatch, tmp_path
+) -> None:
+    ScanClient.directory_info_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", ScanClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref=_entry_source_ref("downloads", is_dir=True),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"
+
+
+def test_validate_import_source_rejects_everything_when_media_root_is_account_root(
+    tmp_path,
+) -> None:
+    provider = storage.Cloud115StorageProvider(
+        library=LibraryHandle(
+            1,
+            "cloud115",
+            {"device_cookie": "cookie", "media_root_cid": "0"},
+            "123",
+        ),
+        data_dir=tmp_path,
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.validate_import_source(
+            source_ref=_dir_source_ref("downloads"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "invalid_config"
+
+
+def test_validate_import_source_maps_api_failure_to_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    class FailingClient(ScanClient):
+        async def directory_info(self, _cid):
+            raise Cloud115RequestError("boom")
+
+    monkeypatch.setattr(storage, "Cloud115Client", FailingClient)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref=_dir_source_ref("downloads"),
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "unavailable"
+    assert error.value.retryable is True
+
+
+def test_validate_import_source_rejects_invalid_ref(tmp_path) -> None:
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).validate_import_source(
+            source_ref={"version": 2, "kind": "cloud115_dir", "cid": "downloads"},
+            source_disposition="keep",
+        )
+
+    assert error.value.code == "source_not_found"
