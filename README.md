@@ -50,3 +50,9 @@ HLS 直连解析不进入账号级请求间隔队列。插件在进程内缓存�
 - `sakuramedia_115_cleanup_empty_media_dirs`：递归扫描配置的媒体目录，只删除没有文件且没有非空子目录的子目录，删除前再次递归检查候选子树是否有文件，配置的媒体根目录本身不会删除。
 
 任务使用 115 目录分页和批量删除接口，不逐个文件发请求。
+
+## License
+
+本项目采用 [PolyForm Noncommercial License 1.0.0](./LICENSE)，仅允许非商业用途。
+
+Copyright (C) 2026 tinypinglite
