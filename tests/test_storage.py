@@ -239,6 +239,35 @@ def _scan_provider(tmp_path) -> storage.Cloud115StorageProvider:
     )
 
 
+def _transfer_media(
+    provider: storage.Cloud115StorageProvider,
+    *,
+    content_md5: str | None = None,
+    content_sha1: str | None = None,
+) -> MediaHandle:
+    entry = Cloud115Entry(
+        "source-fid",
+        "source-parent",
+        "source.mp4",
+        False,
+        99,
+        "source-storage-sha",
+        "source-pickcode",
+        0,
+        True,
+    )
+    return MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=storage._media_ref(entry),
+        file_name="source.mp4",
+        file_size_bytes=99,
+        duration_seconds=0,
+        content_md5=content_md5,
+        content_sha1=content_sha1,
+    )
+
+
 def test_stage_transfer_uses_operation_directory_and_abort_deletes_file_first(
     monkeypatch, tmp_path
 ) -> None:
@@ -258,7 +287,7 @@ def test_stage_transfer_uses_operation_directory_and_abort_deletes_file_first(
     monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
     provider = _scan_provider(tmp_path)
     staged = provider.stage_transfer(
-        source=TransferSource(),
+        source=CachedHashTransferSource(),
         placement=ImportPlacement(relative_path="folder/source.mp4"),
         operation_key="task:1:item:2",
     )
@@ -284,7 +313,7 @@ def test_stage_transfer_not_hit_removes_its_empty_operation_directory(monkeypatc
     monkeypatch.setattr(storage, "Cloud115Client", TransferClient)
     monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
     staged = _scan_provider(tmp_path).stage_transfer(
-        source=TransferSource(),
+        source=CachedHashTransferSource(),
         placement=ImportPlacement(relative_path="folder/source.mp4"),
         operation_key="task:1:item:3",
     )
@@ -320,6 +349,113 @@ def test_stage_transfer_reuses_source_sha1_without_reading_file(
     assert staged.receipt["target_sha1"] == "A" * 40
 
 
+def test_stage_transfer_skips_without_source_sha1(monkeypatch, tmp_path):
+    class NoClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("missing SHA1 must skip before remote calls")
+
+    monkeypatch.setattr(storage, "Cloud115Client", NoClient)
+
+    result = _scan_provider(tmp_path).stage_transfer(
+        source=TransferSource(),
+        placement=ImportPlacement(relative_path="folder/source.mp4"),
+        operation_key="task:no-sha1",
+    )
+
+    assert result.status == "not_available"
+
+
+def test_open_transfer_source_uses_only_media_hashes(monkeypatch, tmp_path):
+    class NoClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("opening a transfer source must not access 115")
+
+    monkeypatch.setattr(storage, "Cloud115Client", NoClient)
+    provider = _scan_provider(tmp_path)
+    media = _transfer_media(provider, content_md5="B" * 32)
+
+    with provider.open_transfer_source(media=media) as source:
+        assert source.info.content_md5 == "B" * 32
+        assert source.info.content_sha1 is None
+        source.assert_unchanged()
+
+
+def test_open_transfer_source_drops_invalid_media_hashes(monkeypatch, tmp_path):
+    class NoClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("opening a transfer source must not access 115")
+
+    monkeypatch.setattr(storage, "Cloud115Client", NoClient)
+    provider = _scan_provider(tmp_path)
+    media = MediaHandle(
+        media_id=1,
+        library=provider.library,
+        storage_ref=storage._media_ref(
+            Cloud115Entry(
+                "source-fid",
+                "source-parent",
+                "source.mp4",
+                False,
+                99,
+                "source-storage-sha",
+                "source-pickcode",
+                0,
+                True,
+            )
+        ),
+        file_name="source.mp4",
+        file_size_bytes=99,
+        duration_seconds=0,
+        content_md5="",
+        content_sha1="not-a-sha1",
+    )
+
+    with provider.open_transfer_source(media=media) as source:
+        assert source.info.content_md5 is None
+        assert source.info.content_sha1 is None
+
+
+def test_cleanup_transfer_source_deletes_original_file(monkeypatch, tmp_path):
+    TransferClient.delete_calls = []
+    monkeypatch.setattr(storage, "Cloud115Client", TransferClient)
+    provider = _scan_provider(tmp_path)
+    media = _transfer_media(provider, content_sha1="A" * 40)
+
+    with provider.open_transfer_source(media=media) as source:
+        provider.cleanup_transfer_source(media=media, source=source)
+
+    assert TransferClient.delete_calls == [(("source-fid",), "source-parent")]
+
+
+def test_cleanup_transfer_source_accepts_missing_file(monkeypatch, tmp_path):
+    class MissingClient(TransferClient):
+        async def delete_files(self, _file_ids, *, parent_cid: str | None = None):
+            raise Cloud115NotFoundError("missing")
+
+    monkeypatch.setattr(storage, "Cloud115Client", MissingClient)
+    provider = _scan_provider(tmp_path)
+    media = _transfer_media(provider, content_sha1="A" * 40)
+
+    with provider.open_transfer_source(media=media) as source:
+        provider.cleanup_transfer_source(media=media, source=source)
+
+
+def test_cleanup_transfer_source_maps_delete_errors(monkeypatch, tmp_path):
+    class FailedClient(TransferClient):
+        async def delete_files(self, _file_ids, *, parent_cid: str | None = None):
+            raise Cloud115RequestError("failed")
+
+    monkeypatch.setattr(storage, "Cloud115Client", FailedClient)
+    provider = _scan_provider(tmp_path)
+    media = _transfer_media(provider, content_sha1="A" * 40)
+
+    with (
+        provider.open_transfer_source(media=media) as source,
+        pytest.raises(ProviderOperationError),
+    ):
+        provider.cleanup_transfer_source(media=media, source=source)
+
+
 def test_stage_transfer_never_adopts_existing_operation_directory(monkeypatch, tmp_path):
     from sakuramedia_115_provider.exceptions import Cloud115DuplicateNameError
 
@@ -336,7 +472,7 @@ def test_stage_transfer_never_adopts_existing_operation_directory(monkeypatch, t
     monkeypatch.setattr(storage, "Cloud115Client", DuplicateOperationClient)
     with pytest.raises(ProviderOperationError):
         _scan_provider(tmp_path).stage_transfer(
-            source=TransferSource(), placement=ImportPlacement(relative_path="folder/source.mp4"), operation_key="task:duplicate",
+            source=CachedHashTransferSource(), placement=ImportPlacement(relative_path="folder/source.mp4"), operation_key="task:duplicate",
         )
     assert DuplicateOperationClient.delete_calls == []
 
@@ -567,6 +703,13 @@ def test_scan_media_refs_skips_relative_path_queries(monkeypatch, tmp_path) -> N
     assert ScanClient.recursive_calls == ["source"]
     assert ScanClient.list_calls == []
     assert ScanClient.directory_info_calls == []
+
+
+def test_scan_media_refs_rejects_invalid_source_ref(tmp_path) -> None:
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).scan_media_refs(source_ref={"kind": "invalid"})
+
+    assert error.value.code == "source_not_found"
 
 
 def test_scan_managed_media_ref_keys_enumerates_configured_media_root(
@@ -1707,7 +1850,7 @@ def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path,
     monkeypatch.setattr(storage, "Cloud115Client", UnknownClient)
     with pytest.raises(ProviderOperationError):
         _scan_provider(tmp_path).stage_transfer(
-            source=TransferSource(),
+            source=CachedHashTransferSource(),
             placement=ImportPlacement(relative_path="folder/source.mp4"),
             operation_key="task:unknown",
         )
@@ -1731,7 +1874,7 @@ def test_transfer_batch_reuses_parent_inventory(monkeypatch, tmp_path):
     provider = _scan_provider(tmp_path)
     for i in range(2):
         provider.stage_transfer(
-            source=TransferSource(),
+            source=CachedHashTransferSource(),
             placement=ImportPlacement(relative_path=f"folder/movie-{i}/source.mp4"),
             operation_key=f"task:{i}",
         )
@@ -1764,7 +1907,7 @@ def test_invalid_upload_cookie_is_rejected_before_hash_or_directory_requests(
     )
     with pytest.raises(ProviderOperationError) as error:
         provider.stage_transfer(
-            source=TransferSource(),
+            source=CachedHashTransferSource(),
             placement=ImportPlacement(relative_path="folder/source.mp4"),
             operation_key="task:bad-cookie",
         )

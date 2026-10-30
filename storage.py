@@ -11,6 +11,7 @@ import re
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -29,6 +30,7 @@ from src.plugins.provider_protocol import (
     LibraryHandle,
     MediaHandle,
     MediaTransferSource,
+    MediaTransferSourceInfo,
     PlaybackContext,
     ProviderOperationError,
     ScanProgressCallback,
@@ -83,6 +85,7 @@ _HASH_HEAD_TAIL_BYTES = 3 * 1024 * 1024
 _HASH_MIDDLE_BYTES = 1024 * 1024
 _HASH_FULL_THRESHOLD = 8 * 1024 * 1024
 _HASH_REQUEST_DELAY_RANGE = (2.0, 4.0)
+_TRANSFER_SOURCE_RANGE_CHUNK_BYTES = 64 * 1024
 # 每个媒体库只保留最近一次下载导入批次的目录清单。
 _IMPORT_DIRECTORIES: dict[
     tuple[str | None, int, str], tuple[str, dict[str, dict[str, str]]]
@@ -114,6 +117,12 @@ def _metadata_resolution(info: JsonObject) -> str | None:
     return f"{width}x{height}" if width and height else None
 
 
+def _valid_source_hash(value: object, length: int) -> str | None:
+    if isinstance(value, str) and re.fullmatch(rf"[0-9A-Fa-f]{{{length}}}", value):
+        return value
+    return None
+
+
 def _staged_media(
     *,
     storage_ref: JsonObject,
@@ -140,6 +149,40 @@ def _staged_media(
         duration_seconds=duration_seconds,
         video_info=video_info,
     )
+
+
+class _Cloud115TransferSource:
+    def __init__(
+        self,
+        *,
+        provider: Cloud115StorageProvider,
+        media: MediaHandle,
+        entry: Cloud115Entry,
+    ) -> None:
+        self._provider = provider
+        self._media = media
+        self._entry = entry
+        self.info = MediaTransferSourceInfo(
+            file_name=media.file_name,
+            size_bytes=media.file_size_bytes,
+            content_md5=_valid_source_hash(
+                getattr(media, "content_md5", None), 32
+            ),
+            content_sha1=_valid_source_hash(
+                getattr(media, "content_sha1", None), 40
+            ),
+        )
+
+    def open_reader(self) -> Cloud115RangeReader:
+        return self._provider._range_reader(
+            self._media,
+            operation="open_transfer_source",
+            max_fetched_bytes=None,
+            chunk_size=_TRANSFER_SOURCE_RANGE_CHUNK_BYTES,
+        )
+
+    def assert_unchanged(self) -> None:
+        return None
 
 
 class Cloud115StorageProvider:
@@ -340,6 +383,43 @@ class Cloud115StorageProvider:
             raise _cloud_error("scan_media_refs", exc) from exc
         except ValueError as exc:
             raise _error("scan_media_refs", "source_not_found", "115 扫描源无效") from exc
+
+    @contextmanager
+    def open_transfer_source(self, *, media: MediaHandle):
+        entry = _media_entry(media.storage_ref, operation="open_transfer_source")
+        if entry.is_dir:
+            raise _error(
+                "open_transfer_source", "source_not_found", "115 迁移源不是文件"
+            )
+        yield _Cloud115TransferSource(provider=self, media=media, entry=entry)
+
+    def cleanup_transfer_source(
+        self, *, media: MediaHandle, source: MediaTransferSource
+    ) -> None:
+        if (
+            not isinstance(source, _Cloud115TransferSource)
+            or source._provider is not self
+            or source._media != media
+        ):
+            raise _error(
+                "cleanup_transfer_source",
+                "invalid_config",
+                "115 迁移源会话不匹配",
+            )
+
+        async def delete() -> None:
+            async with Cloud115Client(self._device_cookie) as client:
+                await client.delete_files(
+                    [source._entry.entry_id],
+                    parent_cid=source._entry.parent_id,
+                )
+
+        try:
+            run_sync(delete())
+        except Cloud115NotFoundError:
+            return
+        except Cloud115Error as exc:
+            raise _cloud_error("cleanup_transfer_source", exc) from exc
 
     def scan_managed_media_ref_keys(self) -> set[str]:
         """Enumerate the configured media root's stable pickcodes once."""
@@ -780,6 +860,16 @@ class Cloud115StorageProvider:
                 or source_size < 0
             ):
                 raise ValueError("invalid transfer source metadata")
+            source_sha1 = getattr(source.info, "content_sha1", None)
+            if not isinstance(source_sha1, str) or re.fullmatch(
+                r"[0-9A-Fa-f]{40}", source_sha1
+            ) is None:
+                logger.info(
+                    "115 秒传跳过：源媒体缺少 SHA1 library_id={} operation_key={}",
+                    self.library.library_id,
+                    operation_key,
+                )
+                return StagedMediaTransfer(status="not_available")
         except (AttributeError, ValueError) as exc:
             raise _error("stage_transfer", "invalid_config", "媒体传输参数无效") from exc
 
@@ -789,6 +879,7 @@ class Cloud115StorageProvider:
                     source=source,
                     source_name=source_name,
                     source_size=source_size,
+                    source_sha1=source_sha1.upper(),
                     placement_parts=placement_parts,
                     operation_dir=operation_dir,
                 )
@@ -834,6 +925,7 @@ class Cloud115StorageProvider:
         source: MediaTransferSource,
         source_name: str,
         source_size: int,
+        source_sha1: str,
         placement_parts: tuple[str, ...],
         operation_dir: str,
     ) -> StagedMediaTransfer:
@@ -847,25 +939,6 @@ class Cloud115StorageProvider:
         ) as client:
             # 不支持的 Cookie 在哈希和远端建目录之前拒绝。
             client._rapid_upload_protocol()
-            # Hash before mkdir/init; only this successful mkdir owns the operation directory.
-            provided_sha1 = getattr(source.info, "content_sha1", None)
-            if isinstance(provided_sha1, str) and re.fullmatch(
-                r"[0-9A-Fa-f]{40}", provided_sha1
-            ):
-                source_sha1 = provided_sha1.upper()
-                logger.info(
-                    "115 秒传复用源文件 SHA1 operation_dir={} size_bytes={}",
-                    operation_dir,
-                    source_size,
-                )
-            else:
-                hash_started = time.monotonic()
-                logger.info("115 秒传源文件哈希开始 operation_dir={} size_bytes={}", operation_dir, source_size)
-                source_sha1 = await asyncio.to_thread(
-                    client._hash_source, source, source_size
-                )
-                logger.info("115 秒传源文件哈希完成 operation_dir={} elapsed_seconds={:.2f}",
-                            operation_dir, time.monotonic() - hash_started)
             source.assert_unchanged()
             parent = self._media_root_cid
             for component in placement_parts[:-1]:
@@ -1652,7 +1725,7 @@ class Cloud115StorageProvider:
         media: MediaHandle,
         *,
         operation: str,
-        max_fetched_bytes: int,
+        max_fetched_bytes: int | None,
         request_delay_range: tuple[float, float] | None = None,
         chunk_size: int = 4 * 1024 * 1024,
     ) -> Cloud115RangeReader:
