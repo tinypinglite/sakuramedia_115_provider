@@ -192,6 +192,15 @@ class TransferSource:
         return None
 
 
+class CachedHashTransferSource(TransferSource):
+    info = MediaTransferSourceInfo(
+        file_name="source.mp4",
+        size_bytes=99,
+        content_md5="B" * 32,
+        content_sha1="A" * 40,
+    )
+
+
 class MovedReceiptClient(TransferClient):
     async def file_by_id(self, file_id: str):
         return Cloud115Entry(
@@ -282,6 +291,33 @@ def test_stage_transfer_not_hit_removes_its_empty_operation_directory(monkeypatc
 
     assert staged.status == "not_available"
     assert TransferClient.delete_calls == [(("op-cid",), None)]
+
+
+def test_stage_transfer_reuses_source_sha1_without_reading_file(
+    monkeypatch, tmp_path
+) -> None:
+    TransferClient.rapid_status = "success"
+
+    class NoHashClient(TransferClient):
+        @staticmethod
+        def _hash_source(_source, _size_bytes: int) -> str:
+            raise AssertionError("source sha1 must be reused")
+
+    async def find_dir(_client, *, parent_cid: str, name: str) -> str:
+        return "folder-cid" if name == "folder" else "op-cid"
+
+    monkeypatch.setattr(storage, "Cloud115Client", NoHashClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
+
+    staged = _scan_provider(tmp_path).stage_transfer(
+        source=CachedHashTransferSource(),
+        placement=ImportPlacement(relative_path="folder/source.mp4"),
+        operation_key="task:1:item:4",
+    )
+
+    assert staged.status == "staged"
+    assert staged.receipt is not None
+    assert staged.receipt["target_sha1"] == "A" * 40
 
 
 def test_stage_transfer_never_adopts_existing_operation_directory(monkeypatch, tmp_path):

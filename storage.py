@@ -848,14 +848,25 @@ class Cloud115StorageProvider:
             # 不支持的 Cookie 在哈希和远端建目录之前拒绝。
             client._rapid_upload_protocol()
             # Hash before mkdir/init; only this successful mkdir owns the operation directory.
-            hash_started = time.monotonic()
-            logger.info("115 秒传源文件哈希开始 operation_dir={} size_bytes={}", operation_dir, source_size)
-            source_sha1 = await asyncio.to_thread(
-                client._hash_source, source, source_size
-            )
+            provided_sha1 = getattr(source.info, "content_sha1", None)
+            if isinstance(provided_sha1, str) and re.fullmatch(
+                r"[0-9A-Fa-f]{40}", provided_sha1
+            ):
+                source_sha1 = provided_sha1.upper()
+                logger.info(
+                    "115 秒传复用源文件 SHA1 operation_dir={} size_bytes={}",
+                    operation_dir,
+                    source_size,
+                )
+            else:
+                hash_started = time.monotonic()
+                logger.info("115 秒传源文件哈希开始 operation_dir={} size_bytes={}", operation_dir, source_size)
+                source_sha1 = await asyncio.to_thread(
+                    client._hash_source, source, source_size
+                )
+                logger.info("115 秒传源文件哈希完成 operation_dir={} elapsed_seconds={:.2f}",
+                            operation_dir, time.monotonic() - hash_started)
             source.assert_unchanged()
-            logger.info("115 秒传源文件哈希完成 operation_dir={} elapsed_seconds={:.2f}",
-                        operation_dir, time.monotonic() - hash_started)
             parent = self._media_root_cid
             for component in placement_parts[:-1]:
                 parent = await self._directory(client, parent, component, self._transfer_directories)
