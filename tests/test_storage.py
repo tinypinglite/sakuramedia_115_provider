@@ -1254,12 +1254,20 @@ def test_thumbnail_generation_reports_target_lookup_and_generated_counts(monkeyp
 
     async def targets(_media):
         assert progress == ["正在获取视频分片"]
-        return [(SimpleNamespace(index=0), [0, 10])], 2
+        return [
+            (SimpleNamespace(index=0), 0),
+            (SimpleNamespace(index=1), 10),
+        ], 2
 
     monkeypatch.setattr(provider, "_thumbnail_targets", targets)
     monkeypatch.setattr(
         provider, "_decode_hls_segment",
-        lambda **_kwargs: [ThumbnailArtifact(0, "0.webp"), ThumbnailArtifact(10, "10.webp")],
+        lambda **kwargs: [
+            ThumbnailArtifact(
+                kwargs["offset_seconds"],
+                f"{kwargs['offset_seconds']}.webp",
+            )
+        ],
     )
     generation = provider.generate_thumbnails(
         media=media, workspace=tmp_path / "thumbnails", progress_callback=progress.append,
@@ -1267,7 +1275,7 @@ def test_thumbnail_generation_reports_target_lookup_and_generated_counts(monkeyp
     assert len(generation.artifacts) == 2
     assert "已生成 0/2 张" in progress[1]
     assert "已生成 2/2 张" in progress[-1]
-    assert "分片 1/1" in progress[-1]
+    assert "分片 2/2" in progress[-1]
 
 
 def test_thumbnail_generation_uses_configured_hls_workers(monkeypatch, tmp_path) -> None:
@@ -1283,7 +1291,7 @@ def test_thumbnail_generation_uses_configured_hls_workers(monkeypatch, tmp_path)
             super().__init__(max_workers=max_workers, **kwargs)
 
     async def targets(_media):
-        return [(SimpleNamespace(index=0), [0])], 1
+        return [(SimpleNamespace(index=0), 0)], 1
 
     monkeypatch.setattr(provider, "_thumbnail_targets", targets)
     monkeypatch.setattr(provider, "_decode_hls_segment", lambda **_kwargs: [])
@@ -1355,17 +1363,24 @@ def test_generate_range_thumbnails_writes_frames_without_request_delay(
     class Frame:
         is_corrupt = False
 
+        def __init__(self, time):
+            self.time = time
+
         def to_image(self):
             return Image()
 
     class Container:
-        streams = SimpleNamespace(video=[object()])
+        video = SimpleNamespace(time_base=1 / 90_000, start_time=90)
+        streams = SimpleNamespace(video=[video])
+
+        def __init__(self):
+            self.frame_times = iter((0.001, 8.342666666666666, 16.684333333333335))
 
         def seek(self, offset, **_kwargs):
             seeks.append(offset)
 
         def decode(self, _video):
-            return iter((Frame(),))
+            return iter((Frame(next(self.frame_times)),))
 
         def close(self):
             pass
@@ -1404,11 +1419,11 @@ def test_generate_range_thumbnails_writes_frames_without_request_delay(
     )
 
     assert generation.expected_count == 3
-    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 8, 16]
     assert [artifact.relative_path for artifact in generation.artifacts] == [
         "thumbnail-0.webp",
-        "thumbnail-10.webp",
-        "thumbnail-20.webp",
+        "thumbnail-8.webp",
+        "thumbnail-16.webp",
     ]
     assert seeks == [0, 10, 20]
     assert reader_calls == [
@@ -1417,11 +1432,89 @@ def test_generate_range_thumbnails_writes_frames_without_request_delay(
     ]
     assert all((workspace / name).read_bytes() == b"webp" for name in (
         "thumbnail-0.webp",
-        "thumbnail-10.webp",
-        "thumbnail-20.webp",
+        "thumbnail-8.webp",
+        "thumbnail-16.webp",
     ))
     assert progress[0] == "正在使用原文件 Range 生成缩略图 · 已生成 0/3 张"
     assert progress[-1] == "正在使用原文件 Range 生成缩略图 · 已生成 3/3 张"
+
+
+def test_generate_range_thumbnails_deduplicates_actual_offsets(monkeypatch, tmp_path) -> None:
+    media = replace(_hash_media(99), duration_seconds=35)
+    provider = storage.Cloud115StorageProvider(library=media.library, data_dir=tmp_path)
+    workspace = tmp_path / "thumbnails"
+    workspace.mkdir()
+
+    class Reader:
+        fetched_bytes = 0
+
+        def close(self):
+            pass
+
+    class Image:
+        def thumbnail(self, *_args):
+            pass
+
+        def save(self, destination, **_kwargs):
+            destination.write_bytes(b"webp")
+
+        def close(self):
+            pass
+
+    class Frame:
+        is_corrupt = False
+
+        def __init__(self, time):
+            self.time = time
+
+        def to_image(self):
+            return Image()
+
+    class Container:
+        video = SimpleNamespace(time_base=1, start_time=0)
+        streams = SimpleNamespace(video=[video])
+
+        def __init__(self):
+            self.frame_times = iter((0, 8.34, 8.34, None))
+
+        def seek(self, _offset, **_kwargs):
+            pass
+
+        def decode(self, _video):
+            frame_time = next(self.frame_times)
+            return iter(()) if frame_time is None else iter((Frame(frame_time),))
+
+        def close(self):
+            pass
+
+    class AV:
+        time_base = 1
+
+        @staticmethod
+        def open(_reader, *, mode):
+            assert mode == "r"
+            return Container()
+
+    class ImageModule:
+        class Resampling:
+            LANCZOS = object()
+
+    monkeypatch.setattr(provider, "_range_reader", lambda *_args, **_kwargs: Reader())
+
+    generation = provider._generate_range_thumbnails(
+        media=media,
+        workspace=workspace,
+        av=AV,
+        image_module=ImageModule,
+        progress_callback=None,
+    )
+
+    assert generation.expected_count == 3
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 8]
+    assert sorted(path.name for path in workspace.iterdir()) == [
+        "thumbnail-0.webp",
+        "thumbnail-8.webp",
+    ]
 
 
 def test_generate_range_thumbnails_reads_duration_from_container_when_media_lacks_it(
@@ -1505,9 +1598,26 @@ def test_thumbnail_targets_group_offsets_by_hls_segment() -> None:
     )
 
     assert expected_count == 2
-    assert [(segment.index, offsets) for segment, offsets in targets] == [
-        (0, [0]),
-        (1, [10]),
+    assert [(segment.index, offset) for segment, offset in targets] == [
+        (0, 0),
+        (1, 6),
+    ]
+
+
+def test_thumbnail_targets_use_cumulative_segment_starts_and_deduplicate() -> None:
+    targets, expected_count = storage._thumbnail_targets(
+        (
+            Cloud115VideoSegment(0, "https://hls.example/0.ts", 10.123),
+            Cloud115VideoSegment(1, "https://hls.example/1.ts", 10.01),
+            Cloud115VideoSegment(2, "https://hls.example/2.ts", 18.185),
+        )
+    )
+
+    assert expected_count == 3
+    assert [(segment.index, offset) for segment, offset in targets] == [
+        (0, 0),
+        (1, 10),
+        (2, 20),
     ]
 
 

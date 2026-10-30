@@ -1316,12 +1316,12 @@ class Cloud115StorageProvider:
                 executor.submit(
                     self._decode_hls_segment,
                     segment=segment,
-                    offsets=offsets,
+                    offset_seconds=offset_seconds,
                     workspace=workspace,
                     av=av,
                     image_module=Image,
                 ): segment.index
-                for segment, offsets in targets
+                for segment, offset_seconds in targets
             }
             remaining = set(futures)
             next_segment_log = THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL
@@ -1383,7 +1383,7 @@ class Cloud115StorageProvider:
 
     async def _thumbnail_targets(
         self, media: MediaHandle
-    ) -> tuple[list[tuple[Cloud115VideoSegment, list[int]]], int]:
+    ) -> tuple[list[tuple[Cloud115VideoSegment, int]], int]:
         entry = _media_entry(media.storage_ref, operation="generate_thumbnails")
         async with Cloud115Client(self._device_cookie) as client:
             info = await client.get_video_info(entry.pickcode)
@@ -1396,7 +1396,7 @@ class Cloud115StorageProvider:
     def _decode_hls_segment(
         *,
         segment: Cloud115VideoSegment,
-        offsets: list[int],
+        offset_seconds: int,
         workspace: Path,
         av,
         image_module,
@@ -1421,14 +1421,14 @@ class Cloud115StorageProvider:
             image = frame.to_image()
             try:
                 image.thumbnail((640, 360), image_module.Resampling.LANCZOS)
-                artifacts = []
-                for offset in offsets:
-                    destination = workspace / f"thumbnail-{offset}.webp"
-                    image.save(destination, format="WEBP", quality=82, method=4)
-                    artifacts.append(
-                        ThumbnailArtifact(offset_seconds=offset, relative_path=destination.name)
+                destination = workspace / f"thumbnail-{offset_seconds}.webp"
+                image.save(destination, format="WEBP", quality=82, method=4)
+                return [
+                    ThumbnailArtifact(
+                        offset_seconds=offset_seconds,
+                        relative_path=destination.name,
                     )
-                return artifacts
+                ]
             finally:
                 image.close()
         finally:
@@ -1453,7 +1453,9 @@ class Cloud115StorageProvider:
         )
         container = None
         artifacts: list[ThumbnailArtifact] = []
-        expected_count = 0
+        planned_count = 0
+        failed_count = 0
+        seen_offsets: set[int] = set()
         started_at = time.monotonic()
         try:
             container = av.open(reader, mode="r")
@@ -1469,15 +1471,16 @@ class Cloud115StorageProvider:
                     error_code="cloud115_thumbnail_unavailable",
                 )
             offsets = tuple(range(0, duration, THUMBNAIL_INTERVAL_SECONDS))
-            expected_count = len(offsets)
+            planned_count = len(offsets)
             if progress_callback:
-                progress_callback(f"正在使用原文件 Range 生成缩略图 · 已生成 0/{expected_count} 张")
+                progress_callback(f"正在使用原文件 Range 生成缩略图 · 已生成 0/{planned_count} 张")
             for offset in offsets:
                 if progress_callback:
                     progress_callback(
                         f"正在使用原文件 Range 生成缩略图 · 读取 {offset} 秒"
-                        f" · 已生成 {len(artifacts)}/{expected_count} 张"
+                        f" · 已生成 {len(artifacts)}/{planned_count} 张"
                     )
+                actual_offset = None
                 try:
                     container.seek(offset * av.time_base, backward=True, any_frame=False)
                     frame = next(
@@ -1486,13 +1489,15 @@ class Cloud115StorageProvider:
                     )
                     if frame is None:
                         raise ValueError("clean frame missing")
-                    image = frame.to_image()
-                    try:
-                        image.thumbnail((640, 360), image_module.Resampling.LANCZOS)
-                        destination = workspace / f"thumbnail-{offset}.webp"
-                        image.save(destination, format="WEBP", quality=82, method=4)
-                    finally:
-                        image.close()
+                    actual_offset = _frame_offset_seconds(frame, video, offset)
+                    if actual_offset not in seen_offsets:
+                        image = frame.to_image()
+                        try:
+                            image.thumbnail((640, 360), image_module.Resampling.LANCZOS)
+                            destination = workspace / f"thumbnail-{actual_offset}.webp"
+                            image.save(destination, format="WEBP", quality=82, method=4)
+                        finally:
+                            image.close()
                 except Cloud115RequestError as exc:
                     raise ThumbnailBackendUnavailable(
                         "115 原文件 Range 读取失败",
@@ -1506,16 +1511,19 @@ class Cloud115StorageProvider:
                         offset,
                         safe_error_message(exc),
                     )
+                    failed_count += 1
                     continue
-                artifacts.append(
-                    ThumbnailArtifact(
-                        offset_seconds=offset,
-                        relative_path=f"thumbnail-{offset}.webp",
+                if actual_offset is not None and actual_offset not in seen_offsets:
+                    seen_offsets.add(actual_offset)
+                    artifacts.append(
+                        ThumbnailArtifact(
+                            offset_seconds=actual_offset,
+                            relative_path=f"thumbnail-{actual_offset}.webp",
+                        )
                     )
-                )
                 if progress_callback:
                     progress_callback(
-                        f"正在使用原文件 Range 生成缩略图 · 已生成 {len(artifacts)}/{expected_count} 张"
+                        f"正在使用原文件 Range 生成缩略图 · 已生成 {len(artifacts)}/{planned_count} 张"
                     )
         finally:
             if container is not None:
@@ -1527,12 +1535,12 @@ class Cloud115StorageProvider:
                 self.library.library_id,
                 media.media_id,
                 len(artifacts),
-                expected_count,
+                len(artifacts) + failed_count,
                 reader.fetched_bytes,
                 time.monotonic() - started_at,
             )
         return ThumbnailGeneration(
-            expected_count=expected_count,
+            expected_count=len(artifacts) + failed_count,
             artifacts=tuple(artifacts),
         )
 
@@ -1869,30 +1877,48 @@ def _workspace(workspace: Path, *, operation: str) -> Path:
 
 def _thumbnail_targets(
     segments: tuple[Cloud115VideoSegment, ...],
-) -> tuple[list[tuple[Cloud115VideoSegment, list[int]]], int]:
-    timeline: list[tuple[Cloud115VideoSegment, float]] = []
+) -> tuple[list[tuple[Cloud115VideoSegment, int]], int]:
+    timeline: list[tuple[Cloud115VideoSegment, float, float]] = []
     duration = 0.0
     for segment in segments:
         length = max(0.0, float(segment.duration_seconds))
         if length <= 0:
             continue
+        start = duration
         duration += length
-        timeline.append((segment, duration))
+        timeline.append((segment, start, duration))
     if not timeline:
         raise Cloud115VideoUnavailableError("115 HLS 分片时长无效")
 
-    grouped: dict[int, tuple[Cloud115VideoSegment, list[int]]] = {}
+    selected: dict[int, tuple[Cloud115VideoSegment, int]] = {}
     index = 0
     for offset in range(0, int(duration), THUMBNAIL_INTERVAL_SECONDS):
-        while index < len(timeline) - 1 and offset >= timeline[index][1]:
+        while index < len(timeline) - 1 and offset >= timeline[index][2]:
             index += 1
-        segment = timeline[index][0]
-        grouped.setdefault(segment.index, (segment, []))[1].append(offset)
-    if not grouped:
+        segment, start, _end = timeline[index]
+        actual_offset = max(0, int(start))
+        selected.setdefault(actual_offset, (segment, actual_offset))
+    if not selected:
         segment = timeline[0][0]
-        grouped[segment.index] = (segment, [0])
-    targets = list(grouped.values())
-    return targets, sum(len(offsets) for _, offsets in targets)
+        selected[0] = (segment, 0)
+    targets = list(selected.values())
+    return targets, len(targets)
+
+
+def _frame_offset_seconds(frame, video, fallback: int) -> int:
+    """Convert an absolute frame timestamp to a playback-relative second."""
+    frame_time = getattr(frame, "time", None)
+    time_base = getattr(video, "time_base", None)
+    if frame_time is None:
+        pts = getattr(frame, "pts", None)
+        if pts is not None and time_base is not None:
+            frame_time = float(pts * time_base)
+    if frame_time is None:
+        return max(0, int(fallback))
+    start_time = getattr(video, "start_time", None)
+    if start_time is not None and time_base is not None:
+        frame_time -= float(start_time * time_base)
+    return max(0, int(frame_time))
 
 
 def _container_duration_seconds(container, video, av) -> int:
