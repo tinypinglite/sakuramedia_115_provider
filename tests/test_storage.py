@@ -1384,8 +1384,12 @@ def test_generate_range_thumbnails_writes_frames_without_request_delay(
         class Resampling:
             LANCZOS = object()
 
-    def range_reader(_media, *, operation, max_fetched_bytes, request_delay_range=None):
-        reader_calls.append((operation, max_fetched_bytes, request_delay_range))
+    def range_reader(
+        _media, *, operation, max_fetched_bytes, request_delay_range=None, chunk_size
+    ):
+        reader_calls.append(
+            (operation, max_fetched_bytes, request_delay_range, chunk_size)
+        )
         return Reader()
 
     monkeypatch.setattr(provider, "_range_reader", range_reader)
@@ -1408,7 +1412,7 @@ def test_generate_range_thumbnails_writes_frames_without_request_delay(
     ]
     assert seeks == [0, 10, 20]
     assert reader_calls == [
-        ("generate_thumbnails", 99, None),
+        ("generate_thumbnails", 99, None, 64 * 1024),
         ("close",),
     ]
     assert all((workspace / name).read_bytes() == b"webp" for name in (

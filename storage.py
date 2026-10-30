@@ -73,6 +73,8 @@ THUMBNAIL_INTERVAL_SECONDS = 10
 THUMBNAIL_HLS_MAX_WORKERS = 4
 THUMBNAIL_PROGRESS_LOG_SEGMENT_INTERVAL = 50
 THUMBNAIL_PROGRESS_LOG_INTERVAL_SECONDS = 5
+# 缩略图只读关键帧附近数据，小块可显著减少 Range 流量。
+_THUMBNAIL_RANGE_CHUNK_BYTES = 64 * 1024
 COVER_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 IMPORT_PROBE_MAX_FETCHED_BYTES = 64 * 1024 * 1024
 IMPORT_PROBE_REQUEST_DELAY_RANGE = (1.0, 2.0)
@@ -1447,6 +1449,7 @@ class Cloud115StorageProvider:
             media,
             operation="generate_thumbnails",
             max_fetched_bytes=media.file_size_bytes,
+            chunk_size=_THUMBNAIL_RANGE_CHUNK_BYTES,
         )
         container = None
         artifacts: list[ThumbnailArtifact] = []
@@ -1632,6 +1635,7 @@ class Cloud115StorageProvider:
         operation: str,
         max_fetched_bytes: int,
         request_delay_range: tuple[float, float] | None = None,
+        chunk_size: int = 4 * 1024 * 1024,
     ) -> Cloud115RangeReader:
         entry = _media_entry(media.storage_ref, operation=operation)
 
@@ -1657,6 +1661,7 @@ class Cloud115StorageProvider:
             file_size_bytes=size,
             max_fetched_bytes=max_fetched_bytes,
             request_delay_range=request_delay_range,
+            chunk_size=chunk_size,
         )
 
     @staticmethod
