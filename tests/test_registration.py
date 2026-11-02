@@ -19,7 +19,8 @@ def test_registration_declares_provider_and_manual_jobs(tmp_path: Path) -> None:
     bundle = validate_media_provider_extension(plugin_id=PLUGIN_ID, extension=extension)
 
     assert registration.host_api_version == manifest["host_api_version"]
-    assert manifest["host_api_version"] == 14
+    assert manifest["version"] == "0.3.1"
+    assert manifest["host_api_version"] == 16
     assert extension.key == MEDIA_PROVIDER_EXTENSION_KEY
     assert bundle.provider_key == "cloud115"
     assert bundle.playback_deliveries == ("redirect", "proxy")
@@ -32,6 +33,18 @@ def test_registration_declares_provider_and_manual_jobs(tmp_path: Path) -> None:
     assert fields["device_cookie"].input == "text"
     assert fields["device_cookie"].required is False
     assert fields["device_cookie"].read_only is False
+    assert bundle.library_login.start_url == "https://115.com/?ct=login&ac=web"
+    assert bundle.library_login.allowed_hosts == ("115.com",)
+    assert bundle.library_login.cookie_captures[0].required_names == (
+        "UID",
+        "CID",
+        "SEID",
+    )
+    assert bundle.library_login.managed_config_keys == (
+        "web_cookie",
+        "device_app",
+        "device_cookie",
+    )
     assert bundle.downloads is not None
 
     assert [job.task_key for job in registration.jobs] == [

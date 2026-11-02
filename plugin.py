@@ -18,8 +18,11 @@ from src.plugins.provider_protocol import (
     ConfigField,
     JsonObject,
     LibraryHandle,
+    LibraryLoginSpec,
     PreparedLibrary,
+    PreparedLibraryLogin,
     ProviderOperationError,
+    WebLoginCookieCapture,
 )
 from src.scheduler.contracts import JobDefinition
 
@@ -50,6 +53,20 @@ MANIFEST = json.loads(
 VERSION = MANIFEST["version"]
 HOST_API_VERSION = MANIFEST["host_api_version"]
 DEFAULT_DEVICE_APP = "alipaymini"
+LOGIN_COOKIE_URL = "https://115.com/"
+
+LIBRARY_LOGIN = LibraryLoginSpec(
+    start_url="https://115.com/?ct=login&ac=web",
+    allowed_hosts=("115.com",),
+    cookie_captures=(
+        WebLoginCookieCapture(
+            url=LOGIN_COOKIE_URL,
+            capture_names=("UID", "CID", "SEID", "KID", "acw_tc"),
+            required_names=("UID", "CID", "SEID"),
+        ),
+    ),
+    managed_config_keys=("web_cookie", "device_app", "device_cookie"),
+)
 
 LIBRARY_CONFIG_FIELDS = (
     ConfigField(
@@ -57,7 +74,7 @@ LIBRARY_CONFIG_FIELDS = (
         label="115 Web Cookie",
         input="text",
         required=False,
-        description="从 115 网页端复制 Cookie；填写后保存时会按「115 登录设备」换取独立设备登录。与「115 专用设备 Cookie」至少填写一个。",
+        description="仅在高级手动填写时使用；填写后保存时会按「115 登录设备」换取独立设备登录。与「115 专用设备 Cookie」至少填写一个。",
         multiline=True,
     ),
     ConfigField(
@@ -73,7 +90,7 @@ LIBRARY_CONFIG_FIELDS = (
         label="115 专用设备 Cookie",
         input="text",
         required=False,
-        description="留空时由 Web Cookie 自动换取；也可直接粘贴微信/支付宝小程序的设备 Cookie，保存时会校验登录是否有效。",
+        description="仅在高级手动填写时使用；留空时由 Web Cookie 自动换取，保存时会校验登录是否有效。",
     ),
     ConfigField(
         key="media_root_path",
@@ -119,6 +136,7 @@ class Cloud115MediaProviderBundle:
     provider_key = "cloud115"
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
+    library_login = LIBRARY_LOGIN
     playback_deliveries = ("redirect", "proxy")
     merged_playback_format = "hls"
 
@@ -170,6 +188,54 @@ class Cloud115MediaProviderBundle:
             logger.warning("115 媒体库配置准备失败 media_root={} downloads_root={} error_type={} reason={}",
                            media_root_path, downloads_root_path, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("prepare_library", exc) from exc
+
+    def resolve_library_login(self, *, captured: JsonObject) -> PreparedLibraryLogin:
+        values = _captured_cookie_values(captured, url=LOGIN_COOKIE_URL)
+        missing = [name for name in ("UID", "CID", "SEID") if not values.get(name)]
+        if missing:
+            raise _error(
+                "library_login",
+                "authentication_failed",
+                "115 登录信息不完整，请重新登录",
+            )
+        web_cookie = "; ".join(
+            f"{name}={values[name]}"
+            for name in ("UID", "CID", "SEID", "KID", "acw_tc")
+            if values.get(name)
+        )
+        try:
+            device_cookie = run_sync(
+                exchange_web_cookie_for_device(
+                    web_cookie,
+                    device_app=DEFAULT_DEVICE_APP,
+                )
+            )
+
+            async def _resolve_account_uid() -> str:
+                async with Cloud115Client(device_cookie) as client:
+                    if not await client.check_alive():
+                        raise Cloud115AuthError("115 专用设备 Cookie 已失效")
+                    return client.user_id
+
+            account_uid = run_sync(_resolve_account_uid())
+        except Cloud115Error as exc:
+            logger.warning(
+                "115 网页登录解析失败 error_type={} reason={}",
+                type(exc).__name__,
+                safe_error_message(exc),
+            )
+            raise _cloud_error("library_login", exc) from exc
+        logger.info("115 网页登录解析成功 account_uid={}", account_uid)
+        return PreparedLibraryLogin(
+            provider_config={
+                "web_cookie": web_cookie,
+                "device_app": DEFAULT_DEVICE_APP,
+                "device_cookie": device_cookie,
+                "account_uid": account_uid,
+            },
+            account_key=account_uid,
+            account_label=account_uid,
+        )
 
     async def _prepare(
         self,
@@ -316,6 +382,27 @@ def _normalise_device_app(value: object) -> str:
             "115 登录设备只支持 wechatmini（微信小程序）或 alipaymini（支付宝小程序）",
         )
     return normalised
+
+
+def _captured_cookie_values(captured: JsonObject, *, url: str) -> dict[str, str]:
+    if not isinstance(captured, dict):
+        raise _error("library_login", "invalid_config", "115 登录信息无效")
+    for item in captured.get("cookies", ()):
+        if not isinstance(item, dict) or item.get("url") != url:
+            continue
+        values = item.get("values")
+        if not isinstance(values, dict):
+            break
+        return {
+            name: value
+            for name, value in values.items()
+            if isinstance(name, str) and isinstance(value, str) and value
+        }
+    raise _error(
+        "library_login",
+        "authentication_failed",
+        "115 登录信息不完整，请重新登录",
+    )
 
 
 def _text_field(submitted_config: JsonObject, previous_config: dict, key: str) -> str:

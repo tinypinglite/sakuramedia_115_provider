@@ -116,6 +116,67 @@ def test_prepare_exchanges_web_cookie_and_resolves_configured_roots(
     }
 
 
+def test_resolve_library_login_exchanges_captured_cookies(
+    monkeypatch, tmp_path: Path
+) -> None:
+    async def exchange(web_cookie: str, *, device_app: str) -> str:
+        assert web_cookie == (
+            "UID=account-cookie; CID=cid; SEID=seid; KID=kid; acw_tc=waf"
+        )
+        assert device_app == "alipaymini"
+        return "UID=device-cookie"
+
+    monkeypatch.setattr(plugin, "Cloud115Client", FakeClient)
+    monkeypatch.setattr(plugin, "exchange_web_cookie_for_device", exchange)
+    bundle = _bundle(tmp_path)
+
+    prepared = bundle.resolve_library_login(
+        captured={
+            "cookies": [
+                {
+                    "url": "https://115.com/",
+                    "values": {
+                        "UID": "account-cookie",
+                        "CID": "cid",
+                        "SEID": "seid",
+                        "KID": "kid",
+                        "acw_tc": "waf",
+                    },
+                }
+            ]
+        }
+    )
+
+    assert prepared.account_key == "123456"
+    assert prepared.account_label == "123456"
+    assert prepared.provider_config == {
+        "web_cookie": (
+            "UID=account-cookie; CID=cid; SEID=seid; KID=kid; acw_tc=waf"
+        ),
+        "device_app": "alipaymini",
+        "device_cookie": "UID=device-cookie",
+        "account_uid": "123456",
+    }
+
+
+def test_resolve_library_login_rejects_incomplete_cookies(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+
+    with pytest.raises(ProviderOperationError) as excinfo:
+        bundle.resolve_library_login(
+            captured={
+                "cookies": [
+                    {
+                        "url": "https://115.com/",
+                        "values": {"UID": "account-cookie"},
+                    }
+                ]
+            }
+        )
+
+    assert excinfo.value.code == "authentication_failed"
+
+
 def test_prepare_exchanges_selected_wechatmini_device(monkeypatch, tmp_path: Path) -> None:
     requested: list[str] = []
 
