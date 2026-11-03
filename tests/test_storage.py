@@ -349,6 +349,73 @@ def test_stage_transfer_reuses_source_sha1_without_reading_file(
     assert staged.receipt["target_sha1"] == "A" * 40
 
 
+def test_stage_transfer_reuses_existing_operation_file(monkeypatch, tmp_path) -> None:
+    existing = Cloud115Entry(
+        "existing-fid", "op-cid", "source.mp4", False, 99, "A" * 40, "existing-pick", 0, True
+    )
+
+    class ReuseClient(TransferClient):
+        async def list_directory(self, cid: str):
+            return (existing,) if cid == "op-cid" else ()
+
+        async def rapid_upload(self, *_args, **_kwargs):
+            raise AssertionError("must reuse the existing operation file")
+
+    async def find_dir(_client, *, parent_cid: str, name: str) -> str:
+        return "folder-cid" if name == "folder" else "op-cid"
+
+    monkeypatch.setattr(storage, "Cloud115Client", ReuseClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
+
+    staged = _scan_provider(tmp_path).stage_transfer(
+        source=CachedHashTransferSource(),
+        placement=ImportPlacement(relative_path="folder/source.mp4"),
+        operation_key="task:reuse",
+    )
+
+    assert staged.status == "staged"
+    assert staged.storage_ref is not None
+    assert staged.storage_ref["kind"] == storage.MEDIA_REF_KIND
+    assert staged.storage_ref["fid"] == "existing-fid"
+    assert staged.storage_ref["pickcode"] == "existing-pick"
+    assert staged.receipt is not None
+    assert staged.receipt["target_fid"] == "existing-fid"
+
+
+def test_stage_transfer_refuses_multiple_operation_matches(monkeypatch, tmp_path) -> None:
+    first = Cloud115Entry(
+        "fid-1", "op-cid", "source.mp4", False, 99, "A" * 40, "pick-1", 0, True
+    )
+    second = Cloud115Entry(
+        "fid-2", "op-cid", "source.mp4", False, 99, "A" * 40, "pick-2", 0, True
+    )
+
+    class ConflictClient(TransferClient):
+        delete_calls = []
+
+        async def list_directory(self, cid: str):
+            return (first, second) if cid == "op-cid" else ()
+
+        async def rapid_upload(self, *_args, **_kwargs):
+            raise AssertionError("must not upload when operation directory is ambiguous")
+
+    async def find_dir(_client, *, parent_cid: str, name: str) -> str:
+        return "folder-cid" if name == "folder" else "op-cid"
+
+    monkeypatch.setattr(storage, "Cloud115Client", ConflictClient)
+    monkeypatch.setattr(storage, "find_or_create_subdir", find_dir)
+
+    with pytest.raises(ProviderOperationError) as error:
+        _scan_provider(tmp_path).stage_transfer(
+            source=CachedHashTransferSource(),
+            placement=ImportPlacement(relative_path="folder/source.mp4"),
+            operation_key="task:conflict",
+        )
+
+    assert error.value.retryable is False
+    assert ConflictClient.delete_calls == []
+
+
 def test_stage_transfer_skips_without_source_sha1(monkeypatch, tmp_path):
     class NoClient:
         def __init__(self, *_args, **_kwargs):
@@ -1839,11 +1906,14 @@ def test_init_unknown_does_not_search_or_delete_operation(monkeypatch, tmp_path,
     from sakuramedia_115_provider.exceptions import Cloud115RequestError
 
     class UnknownClient(TransferClient):
+        upload_attempted = False
+
         async def rapid_upload(self, *_args, **_kwargs):
+            self.upload_attempted = True
             raise Cloud115RequestError("timeout https://upstream.example/file?sign=private-signature UID=private-cookie; SEID=private-session")
 
         async def list_directory(self, cid):
-            assert cid != "op-cid", "must not search an unknown upload"
+            assert not self.upload_attempted, "must not search after an unknown upload"
             return ()
 
     UnknownClient.delete_calls = []

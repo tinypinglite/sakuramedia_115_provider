@@ -919,6 +919,33 @@ class Cloud115StorageProvider:
                     raise
         raise AssertionError("unreachable directory lookup")
 
+    @staticmethod
+    async def _existing_transfer_entry(
+        client: Cloud115Client,
+        *,
+        operation_cid: str,
+        source_name: str,
+        source_size: int,
+        source_sha1: str,
+    ) -> Cloud115Entry | None:
+        entries = await client.list_directory(operation_cid)
+        matches = [
+            entry
+            for entry in entries
+            if not entry.is_dir
+            and entry.name == source_name
+            and entry.size_bytes == source_size
+            and entry.sha1
+            and entry.sha1.upper() == source_sha1.upper()
+        ]
+        if len(matches) > 1:
+            raise _error(
+                "stage_transfer",
+                "unavailable",
+                "115 秒传操作目录包含多个匹配结果",
+            )
+        return matches[0] if matches else None
+
     async def _stage_transfer(
         self,
         *,
@@ -949,15 +976,23 @@ class Cloud115StorageProvider:
             target_entry = None
             not_hit = False
             try:
-                result = await client.rapid_upload(
-                    source,
-                    filename=source_name,
-                    size_bytes=source_size,
-                    parent_cid=operation_cid,
-                    file_sha1=source_sha1,
+                entry = await self._existing_transfer_entry(
+                    client,
+                    operation_cid=operation_cid,
+                    source_name=source_name,
+                    source_size=source_size,
+                    source_sha1=source_sha1,
                 )
-                not_hit = result.status == "not_hit"
-                entry = result.entry
+                if entry is None:
+                    result = await client.rapid_upload(
+                        source,
+                        filename=source_name,
+                        size_bytes=source_size,
+                        parent_cid=operation_cid,
+                        file_sha1=source_sha1,
+                    )
+                    not_hit = result.status == "not_hit"
+                    entry = result.entry
                 if not not_hit and (
                     entry is None
                     or entry.is_dir
