@@ -44,10 +44,16 @@ class FakeClient:
 
 
 def test_offline_submission_uses_display_name_directory(monkeypatch) -> None:
-    async def create(_client, *, parent_cid: str, display_name: str, info_hash: str) -> str:
+    assert offline.Cloud115OfflineDownloadComponent.supported_source_kinds == {
+        "magnet",
+        "torrent",
+        "ed2k",
+        "http",
+    }
+    async def create(_client, *, parent_cid: str, display_name: str, fallback_name: str) -> str:
         assert parent_cid == "downloads"
         assert display_name == "movie"
-        assert info_hash == "0123456789abcdef0123456789abcdef01234567"
+        assert fallback_name == "0123456789abcdef0123456789abcdef01234567"
         return "task-dir"
 
     monkeypatch.setattr(offline, "Cloud115Client", FakeClient)
@@ -72,6 +78,55 @@ def test_offline_submission_uses_display_name_directory(monkeypatch) -> None:
         "kind": "cloud115_dir",
         "cid": "task-dir",
     }
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_uri", "resource_key"),
+    [
+        (
+            "ed2k",
+            "ed2k://|file|movie.mp4|12345|0123456789abcdef0123456789abcdef|/",
+            "ed2k:0123456789abcdef0123456789abcdef:12345",
+        ),
+        (
+            "http",
+            "https://cdn.example/movie.mp4?token=secret",
+            "http:abc123",
+        ),
+    ],
+)
+def test_offline_submission_passes_ed2k_and_http_source_uri(
+    monkeypatch, source_kind, source_uri, resource_key
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class RawClient(FakeClient):
+        async def add_offline_url(self, value: str, *, save_dir_id: str) -> str:
+            calls.append((value, save_dir_id))
+            return "remote-hash"
+
+    async def create(_client, *, parent_cid: str, display_name: str, fallback_name: str) -> str:
+        assert parent_cid == "downloads"
+        assert display_name == "movie"
+        assert fallback_name == resource_key
+        return "task-dir"
+
+    monkeypatch.setattr(offline, "Cloud115Client", RawClient)
+    monkeypatch.setattr(offline, "_create_task_dir", create)
+    provider = offline.Cloud115OfflineDownloadProvider(
+        device_cookie="cookie", downloads_root_cid="downloads"
+    )
+    submitted = provider.submit(
+        submission=DownloadSubmission(
+            source_uri,
+            "movie",
+            source_kind=source_kind,
+            resource_key=resource_key,
+        )
+    )
+
+    assert submitted.remote_id == "remote-hash"
+    assert calls == [(source_uri, "task-dir")]
 
 
 def test_offline_submission_uses_magnet_from_torrent_redirect(monkeypatch) -> None:
@@ -134,6 +189,38 @@ def test_offline_submission_only_reuses_managed_tasks(monkeypatch, managed):
         with pytest.raises(ProviderOperationError) as error:
             provider.submit(submission=submission)
         assert error.value.code == "task_not_managed"
+
+
+def test_offline_submission_rejects_duplicate_without_remote_hash(monkeypatch):
+    info_hash = "0123456789abcdef0123456789abcdef01234567"
+
+    class DuplicateClient(FakeClient):
+        async def add_offline_url(self, _source_uri, *, save_dir_id):
+            raise Cloud115OfflineTaskExistsError("任务已存在")
+
+        async def list_offline_tasks(self, *, page):
+            return (Cloud115OfflineTask("", "movie", 1, 0.5, "", "", "old-dir"),), 1
+
+        async def list_directory(self, _cid):
+            return (Cloud115Entry("old-dir", "downloads", "task-old", True, 0, None, "", 0, False),)
+
+    async def create(_client, **_kwargs):
+        return "new-dir"
+
+    monkeypatch.setattr(offline, "Cloud115Client", DuplicateClient)
+    monkeypatch.setattr(offline, "_create_task_dir", create)
+    provider = offline.Cloud115OfflineDownloadProvider(
+        device_cookie="cookie", downloads_root_cid="downloads"
+    )
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.submit(
+            submission=DownloadSubmission(
+                f"magnet:?xt=urn:btih:{info_hash}", "movie"
+            )
+        )
+
+    assert error.value.code == "task_not_managed"
 
 
 INFO_HASH = "0123456789abcdef0123456789abcdef01234567"
@@ -204,7 +291,7 @@ def test_create_task_dir_uses_sanitized_display_name() -> None:
             DirClient(),
             parent_cid="downloads",
             display_name=display_name,
-            info_hash=INFO_HASH,
+            fallback_name=INFO_HASH,
         )
 
     assert asyncio.run(run("AB/CD-abcdef")) == "dir-cid"

@@ -180,21 +180,29 @@ async def _create_task_dir(
     *,
     parent_cid: str,
     display_name: object,
-    info_hash: str,
+    fallback_name: str,
 ) -> str:
-    name = _safe_dir_name(display_name) or info_hash
+    name = _safe_dir_name(display_name) or fallback_name
     try:
         return await client.mkdir(parent_cid, name)
     except Cloud115DuplicateNameError:
         return await find_or_create_subdir(client, parent_cid=parent_cid, name=name)
 
 
-async def _find_offline_task(client: Cloud115Client, *, info_hash: str):
+async def _find_offline_task(
+    client: Cloud115Client,
+    *,
+    info_hash: str | None = None,
+    save_dir_id: str | None = None,
+):
     page = 1
     while True:
         tasks, page_count = await client.list_offline_tasks(page=page)
         for task in tasks:
-            if task.info_hash.lower() == info_hash:
+            if (
+                (info_hash and task.info_hash.lower() == info_hash)
+                or (save_dir_id and task.save_dir_id == save_dir_id)
+            ):
                 return task
         if page >= page_count or not tasks:
             return None
@@ -203,6 +211,7 @@ async def _find_offline_task(client: Cloud115Client, *, info_hash: str):
 
 class Cloud115OfflineDownloadComponent:
     config_fields: tuple[ConfigField, ...] = ()
+    supported_source_kinds = frozenset({"magnet", "torrent", "ed2k", "http"})
 
     def prepare_client(
         self,
@@ -264,15 +273,38 @@ class Cloud115OfflineDownloadProvider:
     def submit(self, *, submission: DownloadSubmission) -> RemoteDownloadTask:
         if not isinstance(submission.source_uri, str) or not submission.source_uri.strip():
             raise _error("submit_download", "invalid_config", "离线下载链接不能为空")
+        source_uri = submission.source_uri.strip()
+        source_kind = submission.source_kind
+        if source_kind is None:
+            source_kind = (
+                "magnet"
+                if source_uri.lower().startswith("magnet:")
+                else "ed2k"
+                if source_uri.lower().startswith("ed2k://")
+                else "http"
+                if source_uri.lower().startswith(("http://", "https://"))
+                else "torrent"
+            )
         started = time.monotonic()
         logger.info("115 离线下载提交开始 downloads_root_cid={}", self._downloads_root_cid)
-        try:
-            magnet, info_hash = _resolve_source(submission.source_uri.strip())
-        except ProviderOperationError as exc:
-            logger.warning("115 离线下载源解析失败 downloads_root_cid={} code={} reason={}",
-                           self._downloads_root_cid, exc.code, safe_error_message(exc))
-            raise
-        logger.info("115 离线下载源解析完成 downloads_root_cid={} info_hash={}", self._downloads_root_cid, info_hash)
+        info_hash: str | None = None
+        if source_kind in {"ed2k", "http"}:
+            magnet = source_uri
+            fallback_name = submission.resource_key or "task"
+        else:
+            try:
+                magnet, info_hash = _resolve_source(source_uri)
+            except ProviderOperationError as exc:
+                logger.warning("115 离线下载源解析失败 downloads_root_cid={} code={} reason={}",
+                               self._downloads_root_cid, exc.code, safe_error_message(exc))
+                raise
+            fallback_name = info_hash
+        logger.info(
+            "115 离线下载源解析完成 downloads_root_cid={} source_kind={} info_hash={}",
+            self._downloads_root_cid,
+            source_kind,
+            info_hash,
+        )
 
         async def create() -> str:
             async with Cloud115Client(self._device_cookie) as client:
@@ -280,22 +312,30 @@ class Cloud115OfflineDownloadProvider:
                     client,
                     parent_cid=self._downloads_root_cid,
                     display_name=submission.display_name,
-                    info_hash=info_hash,
+                    fallback_name=fallback_name,
                 )
-                logger.info("115 离线下载保存目录已就绪 info_hash={} save_dir_cid={}", info_hash, directory)
+                logger.info(
+                    "115 离线下载保存目录已就绪 source_kind={} save_dir_cid={}",
+                    source_kind,
+                    directory,
+                )
                 try:
                     return await client.add_offline_url(magnet, save_dir_id=directory)
                 except Cloud115OfflineTaskExistsError:
-                    existing = await _find_offline_task(client, info_hash=info_hash)
+                    existing = await _find_offline_task(
+                        client, info_hash=info_hash, save_dir_id=directory
+                    )
                     if existing is not None:
                         managed_dirs = {
                             entry.entry_id
                             for entry in await client.list_directory(self._downloads_root_cid)
                             if entry.is_dir and _is_managed_dir_name(entry.name)
                         }
-                        if existing.save_dir_id in managed_dirs:
+                        existing_hash = (existing.info_hash or "").strip()
+                        # 115 的列表和删除都按 hash 定位；无 hash 的任务无法被宿主跟踪。
+                        if existing.save_dir_id in managed_dirs and existing_hash:
                             logger.info("115 离线下载接管已有任务 info_hash={} save_dir_cid={}", info_hash, existing.save_dir_id)
-                            return existing.info_hash
+                            return existing_hash
                     logger.warning("115 离线下载拒绝接管已有任务 info_hash={} downloads_root_cid={} existing_cid={} reason={}",
                                    info_hash, self._downloads_root_cid,
                                    existing.save_dir_id if existing is not None else None,
@@ -309,8 +349,8 @@ class Cloud115OfflineDownloadProvider:
         try:
             remote_id = run_sync(create())
         except Cloud115Error as exc:
-            logger.warning("115 离线下载提交失败 info_hash={} downloads_root_cid={} error_type={} reason={}",
-                           info_hash, self._downloads_root_cid, type(exc).__name__, safe_error_message(exc))
+            logger.warning("115 离线下载提交失败 source_kind={} downloads_root_cid={} error_type={} reason={}",
+                           source_kind, self._downloads_root_cid, type(exc).__name__, safe_error_message(exc))
             raise _cloud_error("submit_download", exc) from exc
         logger.info("115 离线下载提交完成 remote_id={} downloads_root_cid={} elapsed_seconds={:.2f}",
                     remote_id, self._downloads_root_cid, time.monotonic() - started)
