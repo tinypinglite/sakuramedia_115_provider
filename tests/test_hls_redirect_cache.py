@@ -107,7 +107,7 @@ def upstream(monkeypatch):
     def must_not_reserve_queue(*_args):
         raise AssertionError("HLS redirect resolution must not enter the pacing queue")
 
-    async def download_url(self, pickcode, *, user_agent):
+    async def download_url(self, pickcode, *, user_agent, **_kwargs):
         state.downloads.append((pickcode, user_agent))
         return Cloud115DirectUrl(
             "f",

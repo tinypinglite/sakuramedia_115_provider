@@ -587,6 +587,113 @@ def test_direct_url_issuance_binds_the_requested_user_agent(monkeypatch) -> None
     asyncio.run(run())
 
 
+def test_official_download_url_uses_ios_local_endpoint() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.host == "webapi.115.com"
+        assert request.url.path == "/files/video"
+        assert request.url.params["pick_code"] == "pc"
+        assert request.url.params["local"] == "1"
+        assert request.url.params["supports_origin_file"] == "1"
+        assert request.headers["user-agent"] == Cloud115Client.IOS_APP_USER_AGENT
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "file_status": 0,
+                "file_id": "fid",
+                "file_name": "movie.mp4",
+                "file_size": "10",
+                "sha1": "sha",
+                "pick_code": "pc",
+                "download_url": "https://cdn.example/file?t=9999999999&c=0",
+            },
+        )
+
+    async def run():
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            direct = await client.get_official_download_url("pc")
+            assert direct.file_id == "fid"
+            assert direct.file_name == "movie.mp4"
+            assert direct.file_size_bytes == 10
+            assert direct.url == "https://cdn.example/file?t=9999999999&c=0"
+            assert direct.user_agent == Cloud115Client.IOS_APP_USER_AGENT
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(run())
+
+
+def test_official_download_url_does_not_cross_ua_fallback(monkeypatch) -> None:
+    async def official_failed(self, _pickcode):
+        raise cloud115.Cloud115NotFoundError("official unavailable")
+
+    monkeypatch.setattr(
+        Cloud115Client, "get_official_download_url", official_failed
+    )
+
+    async def run() -> None:
+        client = Cloud115Client("UID=123456_A1_x; CID=c; SEID=s")
+        try:
+            with pytest.raises(cloud115.Cloud115NotFoundError):
+                await client.get_download_url(
+                    "pc",
+                    user_agent=Cloud115Client.IOS_APP_USER_AGENT,
+                    prefer_official=True,
+                    fallback_to_downurl=False,
+                )
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_official_failure_switches_server_fallback_to_browser_ua(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def official_failed(self, _pickcode):
+        raise cloud115.Cloud115NotFoundError("official unavailable")
+
+    async def downurl(self, pickcode: str, *, user_agent: str):
+        seen.append(user_agent)
+        return cloud115.Cloud115DirectUrl(
+            "fid",
+            "movie.mp4",
+            10,
+            "sha",
+            pickcode,
+            "https://cdn.example/file?t=9999999999&c=2",
+            user_agent,
+            9999999999,
+        )
+
+    monkeypatch.setattr(
+        Cloud115Client, "get_official_download_url", official_failed
+    )
+    monkeypatch.setattr(Cloud115Client, "_get_downurl", downurl)
+
+    async def run():
+        client = Cloud115Client("UID=123456_A1_x; CID=c; SEID=s")
+        try:
+            direct = await client.get_download_url(
+                "pc",
+                user_agent=Cloud115Client.IOS_APP_USER_AGENT,
+                prefer_official=True,
+                fallback_to_downurl=True,
+            )
+            assert direct.user_agent == Cloud115Client.DEFAULT_USER_AGENT
+        finally:
+            await client.close()
+        assert seen == [Cloud115Client.DEFAULT_USER_AGENT]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("width,height", [(1920, 1080), ("1920", "1080"), (None, None)])
 def test_video_metadata_uses_live_api_fields_without_hls(width, height) -> None:
     requests = []

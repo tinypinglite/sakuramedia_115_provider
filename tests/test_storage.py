@@ -62,7 +62,7 @@ class FakeClient:
     async def move_files(self, _file_ids, *, parent_cid: str) -> None:
         await self.copy_files([], parent_cid=parent_cid)
 
-    async def get_download_url(self, _pickcode: str, *, user_agent: str):
+    async def get_download_url(self, _pickcode: str, *, user_agent: str, **_kwargs):
         raise AssertionError("direct URL must only be resolved by the range fallback")
 
     async def delete_files(self, _file_ids, *, parent_cid: str | None = None) -> None:
@@ -1097,6 +1097,7 @@ def test_stage_reads_range_metadata_when_video_api_is_unavailable(
     monkeypatch, tmp_path
 ) -> None:
     reader_calls: list[tuple] = []
+    download_calls: list[tuple[str, dict]] = []
 
     async def ensure(_client, *, parent_cid: str, name: str) -> str:
         cid = f"{parent_cid}/{name}"
@@ -1106,7 +1107,8 @@ def test_stage_reads_range_metadata_when_video_api_is_unavailable(
     async def unavailable(_client, _pickcode):
         raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
 
-    async def download_url(_client, _pickcode, *, user_agent: str):
+    async def download_url(_client, _pickcode, *, user_agent: str, **_kwargs):
+        download_calls.append((user_agent, dict(_kwargs)))
         return Cloud115DirectUrl(
             "source-fid", "movie.mp4", 99, "sha", "source-pc",
             "https://cdn.example/movie.mp4", user_agent, 0,
@@ -1180,10 +1182,16 @@ def test_stage_reads_range_metadata_when_video_api_is_unavailable(
     assert staged.duration_seconds == 55
     assert staged.resolution == "3840x2160"
     assert reader_calls == [
-        ("https://cdn.example/movie.mp4", storage._BROWSER_USER_AGENT, 99,
+        ("https://cdn.example/movie.mp4", Cloud115Client.IOS_APP_USER_AGENT, 99,
          storage.IMPORT_PROBE_MAX_FETCHED_BYTES,
          storage.IMPORT_PROBE_REQUEST_DELAY_RANGE),
         ("close",),
+    ]
+    assert download_calls == [
+        (
+            Cloud115Client.IOS_APP_USER_AGENT,
+            {"prefer_official": True, "fallback_to_downurl": True},
+        )
     ]
 
 
@@ -1198,7 +1206,7 @@ def test_stage_imports_with_unknown_metadata_when_range_probe_fails(
     async def unavailable(_client, _pickcode):
         raise Cloud115VideoUnavailableError("115 视频大小或时长不可用")
 
-    async def download_failed(_client, _pickcode, *, user_agent: str):
+    async def download_failed(_client, _pickcode, *, user_agent: str, **_kwargs):
         raise Cloud115RequestError("115 网络请求失败")
 
     FakeClient.entries = {}
@@ -1358,7 +1366,9 @@ class HashClient:
     async def __aexit__(self, *_exc) -> None:
         return None
 
-    async def get_download_url(self, pickcode: str, *, user_agent: str) -> Cloud115DirectUrl:
+    async def get_download_url(
+        self, pickcode: str, *, user_agent: str, **_kwargs
+    ) -> Cloud115DirectUrl:
         return Cloud115DirectUrl(
             "target-fid",
             "movie.mp4",
@@ -1382,7 +1392,7 @@ class VirtualRangeReader:
         max_fetched_bytes: int,
         request_delay_range: tuple[float, float] | None = None,
     ) -> None:
-        assert user_agent == Cloud115Client.DEFAULT_USER_AGENT
+        assert user_agent == Cloud115Client.IOS_APP_USER_AGENT
         assert chunk_size == 1024 * 1024
         assert max_fetched_bytes == 8 * 1024 * 1024
         assert request_delay_range == storage._HASH_REQUEST_DELAY_RANGE

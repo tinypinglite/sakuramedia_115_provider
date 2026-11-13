@@ -42,6 +42,7 @@ from .exceptions import (
 )
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
+_IOS_APP_USER_AGENT = Cloud115Client.IOS_APP_USER_AGENT
 _DIRECT_URL_CACHE_TTL_SECONDS = 10 * 60
 _HLS_REDIRECT_CACHE_TTL_SECONDS = 10 * 60
 _HLS_UNAVAILABLE_CACHE_TTL_SECONDS = 5
@@ -68,7 +69,8 @@ _RELAY_HEADERS = frozenset(
 class _DirectEntry:
     direct: Cloud115DirectUrl
     usable_until: float
-    # 115 直链实测每 URL 并发配额 2：同时 3 个以上 Range 会被瞬时 403 拒绝（非封禁）。
+    # 服务端原文件代理由浏览器 UA 的 c=2 链接承载；该链接每 URL 只允许 2 路并发。
+    # iOS 客户端的 c=0 官方直链走 redirect，不经过这个本地 relay。
     slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
 
 
@@ -434,7 +436,13 @@ class Cloud115Playback:
         logger.info("115 原文件播放地址解析开始 library_id={} media_id={}", media.library.library_id, media.media_id)
         try:
             async with Cloud115Client(self._device_cookie) as client:
-                direct = await client.get_download_url(pickcode, user_agent=user_agent)
+                use_official = user_agent == _IOS_APP_USER_AGENT
+                direct = await client.get_download_url(
+                    pickcode,
+                    user_agent=user_agent,
+                    prefer_official=use_official,
+                    fallback_to_downurl=not use_official,
+                )
         except Cloud115Error as exc:
             raise _cloud_error("playback", exc) from exc
         logger.info("115 原文件播放地址解析完成 library_id={} media_id={} elapsed_seconds={:.2f}",

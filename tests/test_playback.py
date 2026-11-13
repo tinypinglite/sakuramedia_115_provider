@@ -29,6 +29,7 @@ from src.plugins.provider_protocol import LibraryHandle, MediaHandle, PlaybackCo
 class FakeClient:
     fail_hls = False
     download_user_agents: ClassVar[list[str]] = []
+    download_options: ClassVar[list[tuple[str, bool, bool]]] = []
     video_info_pickcodes: ClassVar[list[str]] = []
 
     def __init__(
@@ -58,8 +59,17 @@ class FakeClient:
             Cloud115VideoSegment(1, "https://hls/1.ts", 4.0),
         )
 
-    async def get_download_url(self, _pickcode: str, *, user_agent: str) -> Cloud115DirectUrl:
+    async def get_download_url(
+        self, _pickcode: str, *, user_agent: str, **_kwargs
+    ) -> Cloud115DirectUrl:
         type(self).download_user_agents.append(user_agent)
+        type(self).download_options.append(
+            (
+                user_agent,
+                bool(_kwargs.get("prefer_official")),
+                bool(_kwargs.get("fallback_to_downurl", True)),
+            )
+        )
         return Cloud115DirectUrl("f", "movie.mp4", 10, "sha", "pc", "https://direct/file", user_agent, 0)
 
 
@@ -86,9 +96,13 @@ def _media(media_id: int = 1) -> MediaHandle:
 
 
 def _context(
-    *, delivery: str, range_header: str | None = None, resource_path: str = ""
+    *,
+    delivery: str,
+    range_header: str | None = None,
+    resource_path: str = "",
+    user_agent: str = "player-ua",
 ) -> PlaybackContext:
-    headers = [(b"user-agent", b"player-ua")]
+    headers = [(b"user-agent", user_agent.encode())]
     if range_header:
         headers.append((b"range", range_header.encode()))
     request = Request({"type": "http", "method": "GET", "path": "/", "headers": headers})
@@ -255,6 +269,7 @@ def test_hls_relay_ignores_range_and_rejects_partial_segments(monkeypatch) -> No
 def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
     FakeClient.fail_hls = True
     FakeClient.download_user_agents.clear()
+    FakeClient.download_options.clear()
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
     response = asyncio.run(playback.Cloud115Playback(device_cookie="redirect-cookie").handle(
         media=_media(3), context=_context(delivery="redirect")
@@ -263,6 +278,30 @@ def test_redirect_uses_the_player_user_agent(monkeypatch) -> None:
     assert response.status_code == 302
     assert response.headers["location"] == "https://direct/file"
     assert FakeClient.download_user_agents == ["player-ua"]
+    assert FakeClient.download_options == [("player-ua", False, True)]
+
+
+def test_redirect_uses_official_profile_for_ios_user_agent(monkeypatch) -> None:
+    FakeClient.fail_hls = True
+    FakeClient.download_user_agents.clear()
+    FakeClient.download_options.clear()
+    monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
+
+    response = asyncio.run(
+        playback.Cloud115Playback(device_cookie="ios-redirect-cookie").handle(
+            media=_media(4),
+            context=_context(
+                delivery="redirect",
+                user_agent=Cloud115Client.IOS_APP_USER_AGENT,
+            ),
+        )
+    )
+
+    assert response.status_code == 302
+    assert FakeClient.download_user_agents == [Cloud115Client.IOS_APP_USER_AGENT]
+    assert FakeClient.download_options == [
+        (Cloud115Client.IOS_APP_USER_AGENT, True, False)
+    ]
 
 
 def test_redirect_reuses_direct_url_until_expiry(monkeypatch) -> None:
@@ -270,6 +309,7 @@ def test_redirect_reuses_direct_url_until_expiry(monkeypatch) -> None:
     monkeypatch.setattr(playback, "time", SimpleNamespace(monotonic=lambda: now[0]))
     FakeClient.fail_hls = True
     FakeClient.download_user_agents.clear()
+    FakeClient.download_options.clear()
     monkeypatch.setattr(playback, "Cloud115Client", FakeClient)
     player = playback.Cloud115Playback(device_cookie="redirect-cache-cookie")
     context = _context(delivery="redirect")

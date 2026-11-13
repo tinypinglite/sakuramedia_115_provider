@@ -158,6 +158,7 @@ class Cloud115Client:
 
     _MAX_RETRIES = 2
     _RETRY_BACKOFF_STEP = 0.5
+    IOS_APP_USER_AGENT = "Mozilla/5.0; Darwin/10.0; UDown/39.1.0"
     DEFAULT_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -922,7 +923,63 @@ class Cloud115Client:
             data["pid"] = parent_cid
         await self._json("POST", "https://webapi.115.com/rb/delete", data=data)
 
-    async def get_download_url(self, pickcode: str, *, user_agent: str) -> Cloud115DirectUrl:
+    async def get_official_download_url(self, pickcode: str) -> Cloud115DirectUrl:
+        """Return the iOS playback link used by the official 115 client.
+
+        The ``c=0`` link has a 10-connection quota, but it is bound to the iOS
+        app User-Agent.  Callers that play the returned URL directly must send
+        ``IOS_APP_USER_AGENT`` or the CDN returns 403.
+        """
+        payload = await self._json(
+            "GET",
+            "https://webapi.115.com/files/video",
+            params={
+                "pick_code": pickcode,
+                "local": "1",
+                "supports_origin_file": "1",
+            },
+            headers={
+                "User-Agent": self.IOS_APP_USER_AGENT,
+                "Referer": "https://115.com/",
+            },
+        )
+        url = payload.get("download_url")
+        if not isinstance(url, str) or not url:
+            raise Cloud115NotFoundError("115 未返回官方播放直链")
+        file_size = _as_int(payload.get("file_size"))
+        if file_size <= 0:
+            raise Cloud115NotFoundError("115 官方播放直链缺少文件大小")
+        return Cloud115DirectUrl(
+            file_id=str(payload.get("file_id") or pickcode),
+            file_name=str(payload.get("file_name") or ""),
+            file_size_bytes=file_size,
+            sha1=str(payload.get("sha1") or ""),
+            pickcode=str(payload.get("pick_code") or pickcode),
+            url=url,
+            user_agent=self.IOS_APP_USER_AGENT,
+            expires_at=self._direct_url_expiry(url),
+        )
+
+    async def get_download_url(
+        self,
+        pickcode: str,
+        *,
+        user_agent: str,
+        prefer_official: bool = False,
+        fallback_to_downurl: bool = True,
+    ) -> Cloud115DirectUrl:
+        if prefer_official:
+            try:
+                return await self.get_official_download_url(pickcode)
+            except Cloud115Error:
+                if not fallback_to_downurl:
+                    raise
+                # The c=2 URL is bound to the browser UA, so server-side
+                # callers must switch both URL and reader UA together.
+                user_agent = self.DEFAULT_USER_AGENT
+        return await self._get_downurl(pickcode, user_agent=user_agent)
+
+    async def _get_downurl(self, pickcode: str, *, user_agent: str) -> Cloud115DirectUrl:
         if not pickcode or not user_agent:
             raise ValueError("pickcode and user_agent are required")
         payload = await self._json(

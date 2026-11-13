@@ -65,6 +65,7 @@ from .playback import Cloud115Playback
 from .range_reader import Cloud115RangeReader
 
 _BROWSER_USER_AGENT = Cloud115Client.DEFAULT_USER_AGENT
+_IOS_APP_USER_AGENT = Cloud115Client.IOS_APP_USER_AGENT
 REF_VERSION = 1
 DIR_REF_KIND = "cloud115_dir"
 ENTRY_REF_KIND = "cloud115_entry"
@@ -680,7 +681,10 @@ class Cloud115StorageProvider:
         self, client: Cloud115Client, entry: Cloud115Entry
     ) -> JsonObject | None:
         direct = await client.get_download_url(
-            entry.pickcode, user_agent=_BROWSER_USER_AGENT
+            entry.pickcode,
+            user_agent=_IOS_APP_USER_AGENT,
+            prefer_official=True,
+            fallback_to_downurl=True,
         )
         size_bytes = direct.file_size_bytes or entry.size_bytes
         if size_bytes <= 0:
@@ -1244,7 +1248,9 @@ class Cloud115StorageProvider:
                 await asyncio.sleep(random.uniform(*_HASH_REQUEST_DELAY_RANGE))
                 return await client.get_download_url(
                     entry.pickcode,
-                    user_agent=_BROWSER_USER_AGENT,
+                    user_agent=_IOS_APP_USER_AGENT,
+                    prefer_official=True,
+                    fallback_to_downurl=True,
                 )
 
         try:
@@ -1770,7 +1776,9 @@ class Cloud115StorageProvider:
             async with Cloud115Client(self._device_cookie) as client:
                 return await client.get_download_url(
                     entry.pickcode,
-                    user_agent=_BROWSER_USER_AGENT,
+                    user_agent=_IOS_APP_USER_AGENT,
+                    prefer_official=True,
+                    fallback_to_downurl=True,
                 )
 
         try:
