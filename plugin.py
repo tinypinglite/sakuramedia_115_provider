@@ -138,7 +138,7 @@ class Cloud115MediaProviderBundle:
     library_config_fields = LIBRARY_CONFIG_FIELDS
     library_login = LIBRARY_LOGIN
     playback_deliveries = ("redirect", "proxy")
-    merged_playback_format = "hls"
+    merged_playback_format = "mp4"
 
     def __init__(self, *, data_dir: Path, settings: Cloud115ProviderSettings) -> None:
         self.data_dir = data_dir

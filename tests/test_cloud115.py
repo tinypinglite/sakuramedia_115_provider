@@ -629,6 +629,69 @@ def test_official_download_url_uses_ios_local_endpoint() -> None:
     asyncio.run(run())
 
 
+def test_official_download_url_uses_origin_file_for_hls_ready_media() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["pick_code"] == "pc"
+        assert request.headers["user-agent"] == Cloud115Client.IOS_APP_USER_AGENT
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "file_status": 1,
+                "file_id": "fid",
+                "file_name": "movie.mp4",
+                "file_size": "10",
+                "sha1": "sha",
+                "pick_code": "pc",
+                "download_url": [],
+                "origin_file_url": "https://cdn.example/file?t=9999999999&c=4",
+            },
+        )
+
+    async def run():
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            direct = await client.get_official_download_url("pc")
+            assert direct.url == "https://cdn.example/file?t=9999999999&c=4"
+            assert direct.user_agent == Cloud115Client.IOS_APP_USER_AGENT
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(run())
+
+
+def test_official_download_url_rejects_empty_download_url_without_origin() -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "file_status": 1,
+                "file_size": "10",
+                "download_url": [],
+                "origin_file_url": None,
+            },
+        )
+
+    async def run():
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            client = Cloud115Client(
+                "UID=123456_A1_x; CID=c; SEID=s",
+                http_client=http_client,
+            )
+            with pytest.raises(cloud115.Cloud115NotFoundError):
+                await client.get_official_download_url("pc")
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(run())
+
+
 def test_official_download_url_does_not_cross_ua_fallback(monkeypatch) -> None:
     async def official_failed(self, _pickcode):
         raise cloud115.Cloud115NotFoundError("official unavailable")

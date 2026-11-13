@@ -924,11 +924,12 @@ class Cloud115Client:
         await self._json("POST", "https://webapi.115.com/rb/delete", data=data)
 
     async def get_official_download_url(self, pickcode: str) -> Cloud115DirectUrl:
-        """Return the iOS playback link used by the official 115 client.
+        """Return the original-file link for iOS playback.
 
-        The ``c=0`` link has a 10-connection quota, but it is bound to the iOS
-        app User-Agent.  Callers that play the returned URL directly must send
-        ``IOS_APP_USER_AGENT`` or the CDN returns 403.
+        A not-yet-HLS-ready file (``file_status=0``) exposes the ``c=0``
+        ``download_url`` string; an HLS-ready file (``file_status=1``) exposes
+        the original in ``origin_file_url`` and an empty ``download_url``
+        array. Both links are bound to the iOS app User-Agent.
         """
         payload = await self._json(
             "GET",
@@ -944,6 +945,8 @@ class Cloud115Client:
             },
         )
         url = payload.get("download_url")
+        if not isinstance(url, str) or not url:
+            url = payload.get("origin_file_url")
         if not isinstance(url, str) or not url:
             raise Cloud115NotFoundError("115 未返回官方播放直链")
         file_size = _as_int(payload.get("file_size"))

@@ -17,8 +17,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from loguru import logger
-from starlette.responses import Response
-
 from src.plugins.provider_protocol import (
     BrowseEntry,
     BrowsePage,
@@ -41,9 +39,11 @@ from src.plugins.provider_protocol import (
     ThumbnailBackendUnavailable,
     ThumbnailGeneration,
 )
+from starlette.responses import Response
 
 from .cloud115 import (
     Cloud115Client,
+    Cloud115DirectUrl,
     Cloud115Entry,
     Cloud115VideoSegment,
     TransferState,
@@ -61,6 +61,10 @@ from .exceptions import (
     safe_error_message,
 )
 from .hls_reader import Cloud115HlsSegmentReader
+from .merged_mp4 import Mp4MergeError
+from .merged_playback import build_layout as build_merged_layout
+from .merged_playback import merged_range_requests_response
+from .merged_source import Cloud115MergedSource
 from .playback import Cloud115Playback
 from .range_reader import Cloud115RangeReader
 
@@ -1355,8 +1359,14 @@ class Cloud115StorageProvider:
         medias: tuple[MediaHandle, ...],
         context: PlaybackContext,
     ) -> Response:
+        if context.resource_path != "stream.mp4":
+            raise _error(
+                "merged_playback",
+                "source_not_found",
+                "115 合并播放资源不存在",
+            )
         try:
-            return await self._playback.handle_merged(medias=medias, context=context)
+            layout = await asyncio.to_thread(self._build_merged_layout, medias=medias)
         except (ProviderOperationError, Cloud115Error) as exc:
             cause = exc.__cause__
             logger.warning("115 合并播放失败 library_id={} media_ids={} error_type={} reason={}",
@@ -1364,6 +1374,62 @@ class Cloud115StorageProvider:
                            type(cause).__name__ if cause is not None else type(exc).__name__,
                            safe_error_message(cause if cause is not None else exc))
             raise
+        return merged_range_requests_response(
+            context.request,
+            layout,
+            "video/mp4",
+        )
+
+    def preflight_merged_playback(self, *, medias: tuple[MediaHandle, ...]) -> None:
+        self._build_merged_layout(medias=medias)
+
+    def _build_merged_layout(self, *, medias: tuple[MediaHandle, ...]):
+        sources = []
+        for media in medias:
+            entry = _media_entry(media.storage_ref, operation="merged_playback")
+            sources.append(
+                (
+                    media.media_id,
+                    Cloud115MergedSource(
+                        size=media.file_size_bytes,
+                        identity=(
+                            "cloud115",
+                            media.media_id,
+                            media.file_size_bytes,
+                            entry.entry_id,
+                            entry.pickcode,
+                            media.content_sha1
+                            or (media.storage_ref or {}).get("sha1"),
+                        ),
+                        url_factory=lambda media=media, entry=entry: run_sync(
+                            self._resolve_merged_direct(media, entry.pickcode)
+                        ),
+                    ),
+                )
+            )
+        try:
+            return build_merged_layout(sources)
+        except Mp4MergeError as exc:
+            raise _error(
+                "merged_playback",
+                "unsupported",
+                exc.message,
+            ) from exc
+        except Cloud115Error as exc:
+            raise _cloud_error("merged_playback", exc) from exc
+
+    async def _resolve_merged_direct(
+        self,
+        media: MediaHandle,
+        pickcode: str,
+    ) -> Cloud115DirectUrl:
+        async with Cloud115Client(self._device_cookie) as client:
+            return await client.get_download_url(
+                pickcode,
+                user_agent=_IOS_APP_USER_AGENT,
+                prefer_official=True,
+                fallback_to_downurl=True,
+            )
 
     def open_cover_source(self, *, media: MediaHandle) -> Cloud115RangeReader:
         return self._range_reader(
